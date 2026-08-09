@@ -277,7 +277,17 @@ function setThreadLore(thread, lore) {
 // supposed to free up in the first place.
 const LORE_MAX_CHARS = 2400;
 
+/* Why the last compression pass produced what it did.
+   summarizeForLore has three ways to give up -- a bad HTTP response, an
+   empty parse, or a thrown error -- and all three returned the previous
+   lore unchanged, which on screen is indistinguishable from "it ran and
+   decided nothing needed adding". Four passes with nothing to show for
+   them and no way to tell which branch fired is not a diagnosable state,
+   so each one now records why. Read it in the lore inspector. */
+let _loreLastOutcome = null;
+
 async function summarizeForLore(existingLore, messagesToSummarize) {
+  _loreLastOutcome = null;
   // Instructions go in a SYSTEM message, not the user turn — most modern
   // chat templates weight system content more reliably for format
   // compliance. We also do NOT include m.reasoning: chain-of-thought from
@@ -381,6 +391,8 @@ async function summarizeForLore(existingLore, messagesToSummarize) {
       })
     });
     if (!resp.ok) {
+      _loreLastOutcome = 'HTTP ' + resp.status + ' from the model server';
+      console.error('[lore] request failed:', resp.status, resp.statusText);
       renderLoreIndicator('');
       return existingLore || '';
     }
@@ -414,7 +426,59 @@ async function summarizeForLore(existingLore, messagesToSummarize) {
     // overwriting it with an empty string (which would silently lose
     // every earlier summary).
     let summary = (tmpMsg.content || '').trim();
-    if (!summary) return existingLore || '';
+
+    // Recover text that the thinking-format parser filed as reasoning.
+    //
+    // Both of its reparent guards require state.phase === 'pre'
+    // (03-generation.js:888 and :1031). Two branches leave that phase and
+    // never come back: the server-split branch sets 'thinking_done' when
+    // llama-server returns reasoning_content -- which it does, because
+    // launch.bat starts it with --reasoning-format auto -- and gemma's
+    // header branch sets 'thinking'. Either way the whole reply lands in
+    // .reasoning with nothing to rescue it, and the summariser returned
+    // the previous lore unchanged while the model was answering perfectly.
+    //
+    // For a summary the distinction does not matter. There is no user
+    // watching a chain-of-thought block here; there is a paragraph we
+    // asked for and we want it out of whichever bucket it landed in.
+    if (!summary) {
+      const reasoned = (tmpMsg.reasoning || '').trim();
+      if (reasoned) {
+        summary = reasoned;
+        _loreLastOutcome = 'recovered ' + reasoned.length +
+                           ' chars the parser had filed as reasoning';
+        console.warn('[lore] content was empty; recovered ' + reasoned.length +
+                     ' chars from reasoning. Parser filed the whole reply as ' +
+                     'chain-of-thought.');
+      }
+    }
+
+    // Drop anything before the first field label. If the model did think
+    // out loud before answering, that preamble is now sitting in front of
+    // the summary -- and preamble is exactly the kind of text that makes
+    // the next pass restate things.
+    if (summary) {
+      const fieldStart = summary.match(/^[ \t]*(SETTING|CHARACTERS|OPEN|EVENTS)[ \t]*:/mi);
+      if (fieldStart && fieldStart.index > 0) {
+        summary = summary.slice(fieldStart.index).trim();
+      }
+    }
+
+    if (!summary) {
+      // The interesting case. If .reasoning has text but .content does not,
+      // the model answered and the thinking-format parser filed the whole
+      // reply as chain-of-thought -- a parser problem, not a model one.
+      // Distinguishing those two is the difference between fixing a regex
+      // and rewriting a prompt.
+      const rlen = (tmpMsg.reasoning || '').trim().length;
+      _loreLastOutcome = rlen
+        ? ('model replied but the parser filed all ' + rlen +
+           ' characters as reasoning, not content')
+        : 'model returned nothing at all';
+      console.error('[lore] empty summary.', _loreLastOutcome,
+                    '| format:', normalizeThinkingFormat(activeModel && activeModel.thinkingFormat));
+      return existingLore || '';
+    }
 
     // Cap lore length. Without this, lore grows indefinitely as new
     // batches get folded in, gradually eating the context budget that
@@ -434,6 +498,7 @@ async function summarizeForLore(existingLore, messagesToSummarize) {
     }
     return summary;
   } catch (e) {
+    _loreLastOutcome = 'threw: ' + (e && e.message ? e.message : String(e));
     console.error('Lore summarization failed:', e);
     renderLoreIndicator('');
     return existingLore || '';

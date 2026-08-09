@@ -778,7 +778,11 @@ async function buildContextMessages(thread, card, opts) {
           folded: toArchive.length,
           before: _loreBefore.length,
           after: (summary || '').length,
-          summary: summary || ''
+          summary: summary || '',
+          // null when the pass produced a summary; a reason string when it
+          // gave up. A row with before === after AND a reason is a failure
+          // wearing the same clothes as a no-op.
+          why: (typeof _loreLastOutcome !== 'undefined') ? _loreLastOutcome : null
         });
         while (thread.loreLog.length > 6) thread.loreLog.shift();
       } catch (e) { /* telemetry must never break a turn */ }
@@ -924,6 +928,17 @@ async function buildContextMessages(thread, card, opts) {
   }
 
   const finalApiMessages = normalizeMessagesForStrictTemplates(apiMessages);
+
+  // The 'context' hook, firing for real. It has been in the advertised hook
+  // list since day one and was invoked nowhere, so a card registering for it
+  // got silence -- and on() accepted the registration, so it looked correct.
+  //
+  // Handlers run AFTER normalisation and may mutate the array in place. A
+  // handler that throws is disabled by runCardHook and the turn proceeds
+  // with the array untouched.
+  try {
+    runCardHook('context', { messages: finalApiMessages, thread: thread });
+  } catch (e) { console.error('[card-code] context hook:', e); }
 
   // Diagnostic: log the shape and sizes we're about to send. If you ever
   // see consecutive same-role entries or a leading non-system non-user,

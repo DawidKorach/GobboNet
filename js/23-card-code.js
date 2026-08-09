@@ -40,6 +40,11 @@ let _cardHooks = null;
 let _cardCodeCardId = null;
 let _cardCodeError = null;
 
+/* Only names that are genuinely invoked belong here. 'context' used to be
+   listed and never fired anywhere -- on() accepted it without complaint, so
+   a script registering for it looked correct and did nothing. An API that
+   advertises a hook it does not call is worse than one that lacks it: the
+   failure is silent and reads as your bug. It is wired up now. */
 const CARD_HOOK_NAMES = ['activate', 'deactivate', 'send', 'reply', 'context'];
 
 /** Per-card persistent scratch space, keyed by card id. Survives reloads
@@ -94,6 +99,96 @@ function applyCardCode() {
     },
     store: _cardStore(card.id),
     save() { try { saveState(); } catch (e) {} },
+
+    /* The active thread, for reading. Card code that wants to count turns
+       or look at what was said needs this; without it every non-trivial
+       script has to reach past the API into globals and guess at internals. */
+    get thread() {
+      try { return getActiveThread(); } catch (e) { return null; }
+    },
+
+    /* Run fn once every n replies. This was the single most obvious thing
+       to want and it took a counter in store plus a modulo every time, so
+       it lives here instead. */
+    every(n, fn) {
+      if (typeof n !== 'number' || n < 1 || typeof fn !== 'function') {
+        console.warn('[card-code] every(n, fn) wants a positive number and a function');
+        return;
+      }
+      api.on('reply', (ctx) => {
+        const st = _cardStore(card.id);
+        st._everyCount = (st._everyCount || 0) + 1;
+        if (st._everyCount % n === 0) { try { fn(ctx); } catch (e) { throw e; } }
+      });
+    },
+
+    /* Ask the same local model the chat is using, and get the text back.
+       Card code could not previously do this at all, which is why any
+       script that wanted the model to summarise, track or classify
+       something was impossible to write -- the obvious guesses
+       (gobbo.generate, gobbo.complete) simply did not exist.
+
+       Includes the reasoning-recovery fix from summarizeForLore: when
+       llama-server splits reasoning_content, the whole reply can land in
+       the reasoning bucket with content empty. Anything calling a model
+       from this app has to handle that or it silently gets nothing. */
+    async ask(prompt, opts) {
+      opts = opts || {};
+      const msgs = [];
+      if (opts.system) msgs.push({ role: 'system', content: String(opts.system) });
+      msgs.push({ role: 'user', content: String(prompt == null ? '' : prompt) });
+      try {
+        const resp = await privacyFetch(LLAMA_URL + '/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: 'local',
+            messages: msgs,
+            stream: false,
+            max_tokens: opts.maxTokens || 600,
+            temperature: (typeof opts.temperature === 'number') ? opts.temperature : 0.4
+          })
+        });
+        if (!resp.ok) {
+          console.error('[card-code] ask() failed: HTTP ' + resp.status);
+          return '';
+        }
+        const data = await resp.json();
+        const m = (data && data.choices && data.choices[0] && data.choices[0].message) || {};
+        let out = (m.content || '').trim();
+        if (!out && m.reasoning_content) out = String(m.reasoning_content).trim();
+        return out;
+      } catch (e) {
+        console.error('[card-code] ask() threw:', e);
+        return '';
+      }
+    },
+
+    /* Drop a collapsed note into the transcript.
+
+       It is stored on the thread so it survives a reload, and marked
+       .archived so the model never sees it -- the same flag the rolling
+       archive uses. That combination is what "hidden message behind a
+       spoiler box, like the lore" actually requires, and there was no way
+       to express it before. */
+    note(text, opts) {
+      opts = opts || {};
+      const t = api.thread;
+      if (!t || !Array.isArray(t.messages)) return null;
+      const msg = {
+        role: 'system',
+        content: String(text == null ? '' : text),
+        timestamp: Date.now(),
+        archived: true,          // kept in the UI, never sent to the model
+        cardNote: true,
+        cardNoteLabel: String(opts.label || (card.name + ' note')),
+        cardNoteOpen: !!opts.open
+      };
+      t.messages.push(msg);
+      try { saveState(); } catch (e) {}
+      try { render(); } catch (e) {}
+      return msg;
+    },
     log(...args) { console.log('[card:' + card.name + ']', ...args); },
     notify(msg) {
       try {

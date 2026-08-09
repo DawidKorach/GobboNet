@@ -210,6 +210,20 @@ function renderMessages() {
   const archivedCount = thread.messages.filter(m => m.archived).length;
 
   const messageRows = thread.messages.map((m, i) => {
+    // Card notes render as a collapsed block rather than a chat turn. They
+    // are marked .archived so the model never sees them, which reuses the
+    // rolling archive's existing "visible but not sent" flag rather than
+    // inventing a second one.
+    if (m.cardNote) {
+      const noteBody = parseMarkdown(m.content || '', null);
+      return `<div class="message message-card-note">
+        <details class="cot-block card-note-block"${m.cardNoteOpen ? ' open' : ''}>
+          <summary class="cot-summary">&#128220; ${escapeHtml(m.cardNoteLabel || 'Note')}</summary>
+          <div class="cot-content">${noteBody}</div>
+        </details>
+      </div>`;
+    }
+
     if (m.role === 'system') return '';
     const isUser = m.role === 'user';
     const roleLabel = isUser ? userName : cardName;
@@ -540,7 +554,7 @@ function openLoreInspector() {
       const cls = d > 0 ? 'lore-grow' : (d < 0 ? 'lore-shrink' : '');
       const t = new Date(e.at).toLocaleTimeString();
       const pct = Math.round((e.after / max) * 100);
-      html += '<tr>'
+      html += '<tr' + ((e.why && e.after === 0) ? ' class="lore-failed"' : '') + '>'
         + '<td>' + (i + 1) + '</td>'
         + '<td>' + escapeHtml(t) + '</td>'
         + '<td>' + e.folded + '</td>'
@@ -552,6 +566,29 @@ function openLoreInspector() {
     });
     html += '</tbody></table>';
 
+    // Surface the give-up reasons. A pass that changed nothing because the
+    // model had nothing to add and a pass that changed nothing because the
+    // request 404'd look identical in the size column.
+    // A recovered pass still produced a summary, so it is a note, not a
+    // failure -- amber rows are for passes that yielded nothing.
+    const failed = log.filter(e => e.why && e.after === 0);
+    const noted  = log.filter(e => e.why && e.after > 0);
+    if (failed.length) {
+      html += '<div class="lore-warn"><b>' + failed.length + ' of ' + log.length
+            + ' passes produced no summary.</b><br>';
+      const seen = [];
+      failed.forEach(e => { if (seen.indexOf(e.why) === -1) seen.push(e.why); });
+      seen.forEach(w => { html += '&bull; ' + escapeHtml(w) + '<br>'; });
+      html += '</div>';
+    }
+    if (noted.length) {
+      const seen2 = [];
+      noted.forEach(e => { if (seen2.indexOf(e.why) === -1) seen2.push(e.why); });
+      html += '<div class="lore-meta" style="margin-top:10px">';
+      seen2.forEach(w => { html += '&bull; ' + escapeHtml(w) + '<br>'; });
+      html += '</div>';
+    }
+
     // Only editorialise when there is enough history to mean something.
     if (log.length >= 3) {
       const grew = log.slice(-3).filter(e => (e.after - e.before) > 0).length;
@@ -561,6 +598,13 @@ function openLoreInspector() {
               + 'rewriting, which is what makes fixed details repeat.</div>';
       }
     }
+  }
+
+  if (!log.length && !lore) {
+    html += '<div class="lore-warn">Nothing has been recorded yet. If you have '
+          + 'seen the compression banner but this stays empty, the pass is '
+          + 'failing rather than deciding there is nothing to add \u2014 the '
+          + 'browser console logs the reason under [lore].</div>';
   }
 
   body.innerHTML = html;

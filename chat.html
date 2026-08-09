@@ -341,25 +341,42 @@
           <input type="checkbox" id="card-code-enabled">
           <span>Run this code while this character is active</span>
         </label>
-        <textarea id="card-custom-code" rows="8" spellcheck="false" placeholder="// Runs when this character is activated. Torn down when you switch away.
+        <textarea id="card-custom-code" rows="10" spellcheck="false" placeholder="// Runs when this character is activated. Torn down when you switch away.
 //
-// gobbo.on('send',  ctx =&gt; ...)   return a string to rewrite your message
-// gobbo.on('reply', ctx =&gt; ...)   return a string to rewrite the response
-// gobbo.on('activate',   () =&gt; ...)
-// gobbo.on('deactivate', () =&gt; ...)
+// HOOKS
+// gobbo.on(&#39;send&#39;,    ctx =&gt; ...)  return a string to rewrite your message
+// gobbo.on(&#39;reply&#39;,   ctx =&gt; ...)  return a string to rewrite the response
+// gobbo.on(&#39;context&#39;, ctx =&gt; ...)  ctx.messages is the array about to be sent
+// gobbo.on(&#39;activate&#39;,   () =&gt; ...)
+// gobbo.on(&#39;deactivate&#39;, () =&gt; ...)
 //
-// gobbo.card    this character
-// gobbo.store   an object that persists across reloads
-// gobbo.log()   console, tagged with the character name
-// gobbo.notify('text')   toast
-// gobbo.save()  persist after changing gobbo.store
+// ACTIONS
+// await gobbo.ask(prompt, { system, maxTokens, temperature })  -&gt; string
+// gobbo.note(text, { label, open })   collapsed note; model never sees it
+// gobbo.every(5, ctx =&gt; ...)          run every 5 replies
+// gobbo.notify(&#39;text&#39;)               toast
+//
+// DATA
+// gobbo.card     this character
+// gobbo.thread   the open thread, for reading
+// gobbo.store    an object that persists across reloads
+// gobbo.save()   persist after changing gobbo.store
+// gobbo.log()    console, tagged with the character name
 
-let turns = 0;
-gobbo.on('reply', ctx =&gt; {
-  turns++;
-  if (turns % 10 === 0) gobbo.notify(turns + ' replies so far');
+// Example - a plot tracker that fires every 5 replies:
+gobbo.every(5, async () =&gt; {
+  const recent = gobbo.thread.messages
+    .filter(m =&gt; !m.cardNote).slice(-12)
+    .map(m =&gt; m.role + &#39;: &#39; + m.content).join(&#39;\n&#39;);
+
+  const plot = await gobbo.ask(recent, {
+    system: &#39;Reply with exactly two lines:\nSHORT: the immediate goal\nLONG: the overarching goal&#39;
+  });
+
+  if (plot) gobbo.note(plot, { label: &#39;Plot tracker&#39; });
 });"></textarea>
         <div class="form-hint">
+          <b>Writing this with an AI?</b> Paste the comment block above into it &mdash; that is the whole API, and a model that has not seen it will invent methods that do not exist.<br>
           Runs with full page access &mdash; it is your machine and your code, so there is no sandbox pretending otherwise.
           What it <em>cannot</em> do is break the app: a hook that throws is switched off and logged, and the character keeps working.
           <strong>Cards imported from elsewhere always arrive with their code disabled</strong>, however the file was saved. Read it before you switch it on.

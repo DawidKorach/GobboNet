@@ -52,3 +52,11 @@
 @media (max-width: 700px) {
   #card-custom-code { font-size: 11px; }
 }
+
+/* Card notes. Deliberately quieter than a chat turn -- they are metadata
+   about the story, not part of it, so they should read as an aside you can
+   ignore rather than something the character said. */
+.message-card-note { padding: 2px 0; }
+.card-note-block { border-color: rgba(217, 0, 255, 0.28); }
+.card-note-block > .cot-summary { color: var(--magenta, #d900ff); opacity: 0.8; }
+.card-note-block[open] > .cot-summary { opacity: 1; }

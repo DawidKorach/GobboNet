@@ -138,3 +138,8 @@
   .lore-bar-cell { display: none; }
   .lore-summary-text { font-size: 11px; max-height: 240px; }
 }
+
+/* A pass that gave up. Same row shape, different weight -- the size columns
+   read identically to a genuine no-op, so the row itself has to say. */
+.lore-history tr.lore-failed td { color: rgba(232, 179, 74, 0.85); }
+.lore-history tr.lore-failed td:first-child::after { content: ' !'; font-weight: 700; }
