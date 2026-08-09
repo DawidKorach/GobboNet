@@ -20,3 +20,10 @@ cache/
 temp/
 tmp/
 conversations/
+# Runtime state — never commit
+.gobbonet-state.json
+.swap-status.json
+.last-lan-ip
+active-model.json
+.llama-launch.cmd
+.embed-launch.cmd
