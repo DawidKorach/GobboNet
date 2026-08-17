@@ -381,4 +381,10 @@ Everything GobboNet can do, grouped so it's easy to scan.
 
 ---
 
+## How I handle PRs. 
+
+I'm one highly paranoid goblin and I ship a .exe that non-technical people install, so I need to understand every line that goes out. In practice that means I often reimplement a fix in my own code rather than merging the patch **especially** for security issues. You'll be credited as co-author on the commit and named in the release notes. If I close your PR, it usually means it shipped, not that it was rejected. Bug reports and security findings are hugely welcome even if you don't write a line of code.
+
+---
+
 *GobboNet is brought to you by the GoblinCorps. No corpo money, no venture capital, no masters.*
