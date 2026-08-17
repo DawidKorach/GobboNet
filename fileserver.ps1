@@ -169,12 +169,40 @@ function Read-PerfOverrides {
 Read-PerfOverrides
 $LogFile      = Get-EnvOrDefault 'GEMMA_LOG_FILE'       (Join-Path $Root 'llama-server.log')
 $LaunchScript = Get-EnvOrDefault 'GEMMA_LAUNCH_SCRIPT'  (Join-Path $Root '.llama-launch.cmd')
+$RuntimeState = Get-EnvOrDefault 'GOBBONET_RUNTIME_STATE' ''
 
 $StatePath    = Join-Path $Root '.gobbonet-state.json'
 $SwapLock     = Join-Path $Root '.swap-in-progress'
 $SwapStatus   = Join-Path $Root '.swap-status.json'
 $ModelsListJs = Join-Path $Root 'models-list.json'
 $ActiveJson   = Join-Path $Root 'active-model.json'
+
+# If launch.bat is supervising this file server, keep the launcher's ownership
+# state accurate when a hot-swap creates a replacement chat llama-server.
+# Standalone fileserver.ps1 runs simply leave RuntimeState empty and no-op.
+function Save-LlmRuntimeOwnership {
+    if ([string]::IsNullOrWhiteSpace($RuntimeState)) { return }
+    if (-not (Test-Path -LiteralPath $RuntimeState)) { return }
+
+    try {
+        $lines = @(Get-Content -LiteralPath $RuntimeState -ErrorAction Stop)
+        $found = $false
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^OWN_LLM=(0|1)$') {
+                $lines[$i] = 'OWN_LLM=1'
+                $found = $true
+                break
+            }
+        }
+        if (-not $found) { $lines += 'OWN_LLM=1' }
+
+        $tmp = $RuntimeState + '.fileserver.tmp'
+        [IO.File]::WriteAllLines($tmp, [string[]]$lines, [Text.Encoding]::ASCII)
+        Move-Item -LiteralPath $tmp -Destination $RuntimeState -Force
+    } catch {
+        Write-Host ("[runtime] could not update launcher ownership state: {0}" -f $_.Exception.Message)
+    }
+}
 
 # Detached-generation spool directory (see "Generation jobs" section). Each
 # job is three small files: <id>.sse (raw upstream byte stream), <id>.json
@@ -1650,6 +1678,7 @@ function Handle-SwapModel {
         # a fresh window with its own console host and detaches cleanly,
         # which is the same recipe launch.bat uses at boot.
         $startCmd = ('/c start "llama-server" /min "{0}"' -f $LaunchScript)
+        Save-LlmRuntimeOwnership
         Start-Process -FilePath 'cmd.exe' `
                       -ArgumentList $startCmd `
                       -WindowStyle Hidden `

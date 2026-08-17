@@ -1,19 +1,28 @@
 @echo off
 :: ---------------------------------------------------------------
-:: KEEP-OPEN GUARD -- this window can NEVER silently vanish.
-:: If anything fails (a crash, a blocked tool, a bad path, even a
-:: stray syntax error), the message stays on screen instead of the
-:: window closing too fast to read. We relaunch ourselves once
-:: inside "cmd /k", which holds the window open at a prompt no
-:: matter how the script exits. The env var is inherited by the
-:: relaunch, so this happens exactly once and then never again.
+:: KEEP-OPEN / LIFECYCLE GUARD
+:: Relaunch once in a dedicated cmd /c process. cmd /k leaves that
+:: shell alive at a prompt after the batch itself ends, so detached
+:: services have no reliable process lifetime to follow. cmd /c gives
+:: the launcher a real boundary that ends with the batch invocation.
 :: ---------------------------------------------------------------
 if not defined GOBBONET_KEEPOPEN (
     set "GOBBONET_KEEPOPEN=1"
-    cmd /k ""%~f0" %*"
+    cmd /c ""%~f0" %*"
+    set "GOBBONET_KEEPOPEN="
     exit /b
 )
 setlocal EnableDelayedExpansion
+
+:: Find the dedicated cmd.exe that is actually executing launch.bat.
+:: FOR /F runs backtick commands through a short-lived helper cmd.exe,
+:: so asking PowerShell for its immediate parent selects the wrong PID.
+:: Walk ancestors until the command line contains this script path.
+set "LAUNCHER_PID="
+set "GN_LAUNCH_SCRIPT=%~f0"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$cur=$PID; for($i=0;$i -lt 10;$i++){ $p=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $cur) -ErrorAction SilentlyContinue; if($null -eq $p){break}; if($p.Name -ieq 'cmd.exe' -and ([string]$p.CommandLine).IndexOf($env:GN_LAUNCH_SCRIPT,[StringComparison]::OrdinalIgnoreCase) -ge 0){ [Console]::Write($p.ProcessId); break }; $cur=$p.ParentProcessId }" 2^>nul`) do set "LAUNCHER_PID=%%P"
+set "GN_LAUNCH_SCRIPT="
+
 title Gobbonet - Local AI Chat [llama.cpp]
 color 0A
 
@@ -412,6 +421,18 @@ set "EMBED_MODEL_URL=https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/
 set "EMBED_PIN_SHA256="
 set "EMBED_LOG_FILE=%~dp0embed-server.log"
 set "EMBED_LAUNCH_SCRIPT=%~dp0.embed-launch.cmd"
+
+:: Runtime ownership flags. The watchdog only stops services that this
+:: launcher invocation actually spawned. Compatible pre-existing services
+:: are deliberately left alone.
+set "OWN_LLM=0"
+set "OWN_EMBED=0"
+set "OWN_SEARCH=0"
+set "OWN_WEB=0"
+set "RUNTIME_STATE="
+if defined LAUNCHER_PID set "RUNTIME_STATE=%~dp0.gobbonet-runtime-!LAUNCHER_PID!.state"
+call :write_runtime_state
+call :start_runtime_watchdog
 
 goto :main
 
@@ -1513,6 +1534,8 @@ if not "!MODEL_CHAT_TEMPLATE_FILE!"=="" (
     echo "!SERVER_EXE!" --model "!GGUF_PATH!" --port !SERVER_PORT! --host 127.0.0.1 --ctx-size !CTX_SIZE! --n-gpu-layers !GPU_LAYERS! --cache-type-k !KV_CACHE_TYPE! --cache-type-v !KV_CACHE_TYPE! --parallel 1 !JINJA_FLAG! !CHAT_TEMPLATE_FLAG! --reasoning-format auto ^> "!LOG_FILE!" 2^>^&1
 )
 
+set "OWN_LLM=1"
+call :write_runtime_state
 start /min "llama-server" "!LAUNCH_SCRIPT!"
 
 echo  [..] Waiting for server to load model...
@@ -1695,6 +1718,8 @@ if errorlevel 1 (
     echo "!SERVER_EXE!" --model "!EMBED_PATH!" --port !EMBED_PORT! --host 127.0.0.1 --embeddings --pooling mean --ctx-size !EMBED_CTX! --batch-size !EMBED_CTX! --ubatch-size !EMBED_CTX! --n-gpu-layers !EMBED_GPU_LAYERS! ^> "!EMBED_LOG_FILE!" 2^>^&1
 )
 echo  [..] Starting embedding server on :!EMBED_PORT! ^(CPU^)...
+set "OWN_EMBED=1"
+call :write_runtime_state
 start /min "embed-server" "!EMBED_LAUNCH_SCRIPT!"
 
 set "ERETRIES=0"
@@ -1729,6 +1754,8 @@ if not errorlevel 1 (
 )
 
 echo  [..] Starting search proxy on :!SEARCH_PORT!...
+set "OWN_SEARCH=1"
+call :write_runtime_state
 start /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand "JABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQAgAD0AIAAnAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAJwAKAFsATgBlAHQALgBTAGUAcgB2AGkAYwBlAFAAbwBpAG4AdABNAGEAbgBhAGcAZQByAF0AOgA6AFMAZQBjAHUAcgBpAHQAeQBQAHIAbwB0AG8AYwBvAGwAIAA9ACAAWwBOAGUAdAAuAFMAZQBjAHUAcgBpAHQAeQBQAHIAbwB0AG8AYwBvAGwAVAB5AHAAZQBdADoAOgBUAGwAcwAxADIACgAkAGwAaQBzAHQAZQBuAGUAcgAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0ACAAUwB5AHMAdABlAG0ALgBOAGUAdAAuAEgAdAB0AHAATABpAHMAdABlAG4AZQByAAoAJABsAGkAcwB0AGUAbgBlAHIALgBQAHIAZQBmAGkAeABlAHMALgBBAGQAZAAoACcAaAB0AHQAcAA6AC8ALwAxADIANwAuADAALgAwAC4AMQA6ADEAMQA0ADMANQAvACcAKQAKAHQAcgB5ACAAewAgACQAbABpAHMAdABlAG4AZQByAC4AUwB0AGEAcgB0ACgAKQAgAH0AIABjAGEAdABjAGgAIAB7ACAAZQB4AGkAdAAgADEAIAB9AAoAdwBoAGkAbABlACAAKAAkAGwAaQBzAHQAZQBuAGUAcgAuAEkAcwBMAGkAcwB0AGUAbgBpAG4AZwApACAAewAKACAAIAAkAGMAdAB4ACAAPQAgACQAbABpAHMAdABlAG4AZQByAC4ARwBlAHQAQwBvAG4AdABlAHgAdAAoACkACgAgACAAJAByAGUAcwBwACAAPQAgACQAYwB0AHgALgBSAGUAcwBwAG8AbgBzAGUACgAgACAAJAByAGUAcwBwAC4AQQBkAGQASABlAGEAZABlAHIAKAAnAEEAYwBjAGUAcwBzAC0AQwBvAG4AdAByAG8AbAAtAEEAbABsAG8AdwAtAE8AcgBpAGcAaQBuACcALAAgACcAKgAnACkACgAgACAAJAByAGUAcwBwAC4AQQBkAGQASABlAGEAZABlAHIAKAAnAEEAYwBjAGUAcwBzAC0AQwBvAG4AdAByAG8AbAAtAEEAbABsAG8AdwAtAE0AZQB0AGgAbwBkAHMAJwAsACAAJwBQAE8AUwBUACwAIABHAEUAVAAsACAATwBQAFQASQBPAE4AUwAnACkACgAgACAAJAByAGUAcwBwAC4AQQBkAGQASABlAGEAZABlAHIAKAAnAEEAYwBjAGUAcwBzAC0AQwBvAG4AdAByAG8AbAAtAEEAbABsAG8AdwAtAEgAZQBhAGQAZQByAHMAJwAsACAAJwBDAG8AbgB0AGUAbgB0AC0AVAB5AHAAZQAsACAAQQB1AHQAaABvAHIAaQB6AGEAdABpAG8AbgAnACkACgAgACAAaQBmACAAKAAkAGMAdAB4AC4AUgBlAHEAdQBlAHMAdAAuAEgAdAB0AHAATQBlAHQAaABvAGQAIAAtAGUAcQAgACcATwBQAFQASQBPAE4AUwAnACkAIAB7AAoAIAAgACAAIAAkAHIAZQBzAHAALgBTAHQAYQB0AHUAcwBDAG8AZABlACAAPQAgADIAMAA0ADsAIAAkAHIAZQBzAHAALgBDAGwAbwBzAGUAKAApADsAIABjAG8AbgB0AGkAbgB1AGUACgAgACAAfQAKACAAIAAkAHAAYQB0AGgAIAA9ACAAJABjAHQAeAAuAFIAZQBxAHUAZQBzAHQALgBVAHIAbAAuAEEAYgBzAG8AbAB1AHQAZQBQAGEAdABoAAoAIAAgAGkAZgAgACgAJABwAGEAdABoACAALQBlAHEAIAAnAC8AaABlAGEAbAB0AGgAJwApACAAewAKACAAIAAgACAAJAByAGUAcwBwAC4AUwB0AGEAdAB1AHMAQwBvAGQAZQAgAD0AIAAyADAAMAAKACAAIAAgACAAJABiACAAPQAgAFsAVABlAHgAdAAuAEUAbgBjAG8AZABpAG4AZwBdADoAOgBVAFQARgA4AC4ARwBlAHQAQgB5AHQAZQBzACgAJwB7ACIAcwB0AGEAdAB1AHMAIgA6ACIAbwBrACIAfQAnACkACgAgACAAIAAgACQAcgBlAHMAcAAuAE8AdQB0AHAAdQB0AFMAdAByAGUAYQBtAC4AVwByAGkAdABlACgAJABiACwAIAAwACwAIAAkAGIALgBMAGUAbgBnAHQAaAApADsAIAAkAHIAZQBzAHAALgBDAGwAbwBzAGUAKAApADsAIABjAG8AbgB0AGkAbgB1AGUACgAgACAAfQAKACAAIAB0AHIAeQAgAHsACgAgACAAIAAgACQAcwByACAAPQAgAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABJAE8ALgBTAHQAcgBlAGEAbQBSAGUAYQBkAGUAcgAoACQAYwB0AHgALgBSAGUAcQB1AGUAcwB0AC4ASQBuAHAAdQB0AFMAdAByAGUAYQBtACkACgAgACAAIAAgACQAYgBvAGQAeQAgAD0AIAAkAHMAcgAuAFIAZQBhAGQAVABvAEUAbgBkACgAKQA7ACAAJABzAHIALgBDAGwAbwBzAGUAKAApAAoAIAAgACAAIAAkAHQAYQByAGcAZQB0AFUAcgBsACAAPQAgACcAaAB0AHQAcABzADoALwAvAG8AbABsAGEAbQBhAC4AYwBvAG0ALwBhAHAAaQAnACAAKwAgACQAcABhAHQAaAAKACAAIAAgACAAJABoAGUAYQBkAGUAcgBzACAAPQAgAEAAewAgACcAQwBvAG4AdABlAG4AdAAtAFQAeQBwAGUAJwAgAD0AIAAnAGEAcABwAGwAaQBjAGEAdABpAG8AbgAvAGoAcwBvAG4AJwAgAH0ACgAgACAAIAAgACQAYQB1AHQAaAAgAD0AIAAkAGMAdAB4AC4AUgBlAHEAdQBlAHMAdAAuAEgAZQBhAGQAZQByAHMAWwAnAEEAdQB0AGgAbwByAGkAegBhAHQAaQBvAG4AJwBdAAoAIAAgACAAIABpAGYAIAAoACQAYQB1AHQAaAApACAAewAgACQAaABlAGEAZABlAHIAcwBbACcAQQB1AHQAaABvAHIAaQB6AGEAdABpAG8AbgAnAF0AIAA9ACAAJABhAHUAdABoACAAfQAKACAAIAAgACAAJAB3AHIAIAA9ACAASQBuAHYAbwBrAGUALQBXAGUAYgBSAGUAcQB1AGUAcwB0ACAALQBVAHIAaQAgACQAdABhAHIAZwBlAHQAVQByAGwAIAAtAE0AZQB0AGgAbwBkACAAUABPAFMAVAAgAC0AQgBvAGQAeQAgACQAYgBvAGQAeQAgAC0ASABlAGEAZABlAHIAcwAgACQAaABlAGEAZABlAHIAcwAgAC0AVQBzAGUAQgBhAHMAaQBjAFAAYQByAHMAaQBuAGcAIAAtAFQAaQBtAGUAbwB1AHQAUwBlAGMAIAAzADAACgAgACAAIAAgACQAcgBlAHMAcAAuAEMAbwBuAHQAZQBuAHQAVAB5AHAAZQAgAD0AIAAnAGEAcABwAGwAaQBjAGEAdABpAG8AbgAvAGoAcwBvAG4AJwAKACAAIAAgACAAJABvAGIAIAA9ACAAWwBUAGUAeAB0AC4ARQBuAGMAbwBkAGkAbgBnAF0AOgA6AFUAVABGADgALgBHAGUAdABCAHkAdABlAHMAKAAkAHcAcgAuAEMAbwBuAHQAZQBuAHQAKQAKACAAIAAgACAAJAByAGUAcwBwAC4ATwB1AHQAcAB1AHQAUwB0AHIAZQBhAG0ALgBXAHIAaQB0AGUAKAAkAG8AYgAsACAAMAAsACAAJABvAGIALgBMAGUAbgBnAHQAaAApAAoAIAAgAH0AIABjAGEAdABjAGgAIAB7AAoAIAAgACAAIAAkAHIAZQBzAHAALgBTAHQAYQB0AHUAcwBDAG8AZABlACAAPQAgADUAMAAyAAoAIAAgACAAIAAkAGUAbQAgAD0AIAAnAHsAIgBlAHIAcgBvAHIAIgA6ACIAcAByAG8AeAB5ADoAIAAnACAAKwAgACQAXwAuAEUAeABjAGUAcAB0AGkAbwBuAC4ATQBlAHMAcwBhAGcAZQAuAFIAZQBwAGwAYQBjAGUAKAAnACIAJwAsACcAJwApAC4AUgBlAHAAbABhAGMAZQAoACIAYAByACIALAAnACcAKQAuAFIAZQBwAGwAYQBjAGUAKAAiAGAAbgAiACwAJwAgACcAKQAgACsAIAAnACIAfQAnAAoAIAAgACAAIAAkAGUAYgAgAD0AIABbAFQAZQB4AHQALgBFAG4AYwBvAGQAaQBuAGcAXQA6ADoAVQBUAEYAOAAuAEcAZQB0AEIAeQB0AGUAcwAoACQAZQBtACkACgAgACAAIAAgACQAcgBlAHMAcAAuAE8AdQB0AHAAdQB0AFMAdAByAGUAYQBtAC4AVwByAGkAdABlACgAJABlAGIALAAgADAALAAgACQAZQBiAC4ATABlAG4AZwB0AGgAKQAKACAAIAB9AAoAIAAgACQAcgBlAHMAcAAuAEMAbABvAHMAZQAoACkACgB9AAoA"
 
 set "PRETRIES=0"
@@ -1794,6 +1821,8 @@ set "GEMMA_ACCESS_SECRET=!ACCESS_SECRET!"
 :: fileserver.ps1 resolves the port the same way, but pass it explicitly so
 :: the two can never disagree about which port this run is using.
 set "GEMMA_LISTEN_PORT=!WEB_PORT!"
+set "OWN_WEB=1"
+call :write_runtime_state
 start /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0fileserver.ps1"
 
 set "FRETRIES=0"
@@ -1977,7 +2006,8 @@ echo   This window will minimize in 8 seconds.
 echo   It monitors server health in the background.
 echo.
 echo   To shut down: restore this window and press Ctrl+C,
-echo   or simply close it.
+echo   or simply close it. Services started by this launch are
+echo   cleaned up automatically.
 echo  ====================================================
 echo.
 
@@ -2061,6 +2091,8 @@ set "GN_KILLPORT="
 timeout /t 3 /nobreak >nul
 
 echo  [..] Restarting llama-server...
+set "OWN_LLM=1"
+call :write_runtime_state
 start /min "llama-server" "!LAUNCH_SCRIPT!"
 
 echo  [..] Waiting for server to come back up...
@@ -2107,6 +2139,37 @@ goto :monitor_loop
 :: ===============================================================
 :: UTILITY SUBROUTINES
 :: ===============================================================
+:write_runtime_state
+if not defined RUNTIME_STATE exit /b
+> "!RUNTIME_STATE!.tmp" (
+    echo OWN_LLM=!OWN_LLM!
+    echo OWN_EMBED=!OWN_EMBED!
+    echo OWN_SEARCH=!OWN_SEARCH!
+    echo OWN_WEB=!OWN_WEB!
+)
+move /y "!RUNTIME_STATE!.tmp" "!RUNTIME_STATE!" >nul 2>&1
+exit /b
+
+:start_runtime_watchdog
+if not defined LAUNCHER_PID (
+    echo  [*] Could not determine launcher PID -- automatic child cleanup disabled.
+    exit /b
+)
+if not exist "%~dp0runtime-watchdog.ps1" (
+    echo  [*] runtime-watchdog.ps1 not found -- automatic child cleanup disabled.
+    exit /b
+)
+
+set "GOBBONET_PARENT_PID=!LAUNCHER_PID!"
+set "GOBBONET_RUNTIME_STATE=!RUNTIME_STATE!"
+set "GOBBONET_ROOT=%~dp0."
+set "GOBBONET_LLM_PORT=!SERVER_PORT!"
+set "GOBBONET_EMBED_PORT=!EMBED_PORT!"
+set "GOBBONET_SEARCH_PORT=!SEARCH_PORT!"
+set "GOBBONET_WEB_PORT=!WEB_PORT!"
+start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0runtime-watchdog.ps1"
+exit /b
+
 :minimize_window
 powershell -NoProfile -command "try{Add-Type -Name W -Namespace C -MemberDefinition '[DllImport(\"kernel32.dll\")]public static extern IntPtr GetConsoleWindow();[DllImport(\"user32.dll\")]public static extern bool ShowWindow(IntPtr h,int c);' -EA Stop}catch{};[C.W]::ShowWindow([C.W]::GetConsoleWindow(),6)" >nul 2>&1
 exit /b

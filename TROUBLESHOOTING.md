@@ -157,14 +157,40 @@ launch.bat
 
 ---
 
+## Closing the launcher leaves GobboNet processes running
+
+The Windows launcher starts the chat model, embedding model, search proxy and
+file server as detached background processes. A runtime watchdog now records
+which of those services were started by the current launcher invocation and
+stops only those owned processes when that launcher exits.
+
+Pre-existing services are intentionally not claimed. In particular, an Ollama
+instance that was already running before GobboNet is left untouched.
+
+After closing GobboNet, give the watchdog a few seconds and inspect the usual
+ports if anything appears to remain:
+
+```powershell
+Get-NetTCPConnection -State Listen |
+    Where-Object LocalPort -in 9066,11434,11435,11436,11437 |
+    Sort-Object LocalPort
+```
+
+`runtime-watchdog.log` records the launcher PID, ownership flags, each process
+stopped during cleanup, and the final `cleanup complete` marker. If cleanup did
+not run, include that log in the bug report.
+
+---
+
 ## The model will not load
 
 The launcher stops and shows `llama-server.log`. Two common causes:
 
 - **Not enough VRAM.** Pick a smaller model or a heavier quantisation.
-- **Stale server.** Closing the window without stopping the servers can
-  leave `llama-server.exe` holding the port. Check with
-  `netstat -ano | findstr "11437 11435 11436 9066"` and end those PIDs.
+- **Stale server.** An older GobboNet build, a crashed watchdog, or an
+  abnormal process termination can leave `llama-server.exe` holding the port.
+  Check with `netstat -ano | findstr "11437 11435 11436 9066"` and end those
+  PIDs if necessary.
 
 If a model downloaded but never loads, check for a leftover `.part` file in
 `models\` — that is an aborted download and is safe to delete.
@@ -198,8 +224,9 @@ the gaps, and nothing here will stop you trying.
 Include these in a bug report and it can usually be answered in one reply:
 
 1. `fileserver.log` (whole file)
-2. Whether launch.bat printed **"No working PowerShell found"**
-3. Whether it printed **`[OK] Search proxy on :11435`** — that line proves a
+2. `runtime-watchdog.log` if the problem involves shutdown or stale processes
+3. Whether launch.bat printed **"No working PowerShell found"**
+4. Whether it printed **`[OK] Search proxy on :11435`** — that line proves a
    PowerShell HTTP listener bound successfully minutes earlier, which rules
    out a whole class of theories
-4. Output of `netsh interface ipv4 show excludedportrange protocol=tcp`
+5. Output of `netsh interface ipv4 show excludedportrange protocol=tcp`

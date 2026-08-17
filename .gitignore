@@ -29,3 +29,4 @@ active-model.json
 .embed-launch.cmd
 
 .gobbonet-port
+.gobbonet-runtime-*.state
