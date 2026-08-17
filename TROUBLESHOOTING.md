@@ -167,14 +167,17 @@ stops only those owned processes when that launcher exits.
 Pre-existing services are intentionally not claimed. In particular, an Ollama
 instance that was already running before GobboNet is left untouched.
 
-After closing GobboNet, give the watchdog a few seconds and inspect the usual
-ports if anything appears to remain:
+After closing GobboNet, give the watchdog a few seconds and inspect the
+GobboNet-owned ports if anything appears to remain:
 
 ```powershell
 Get-NetTCPConnection -State Listen |
-    Where-Object LocalPort -in 9066,11434,11435,11436,11437 |
+    Where-Object LocalPort -in 9066,11435,11436,11437 |
     Sort-Object LocalPort
 ```
+
+If Ollama was already running, its listener on `11434` should remain after
+GobboNet exits; the watchdog deliberately does not own or stop it.
 
 `runtime-watchdog.log` records the launcher PID, ownership flags, each process
 stopped during cleanup, and the final `cleanup complete` marker. If cleanup did
