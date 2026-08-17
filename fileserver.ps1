@@ -170,6 +170,10 @@ Read-PerfOverrides
 $LogFile      = Get-EnvOrDefault 'GEMMA_LOG_FILE'       (Join-Path $Root 'llama-server.log')
 $LaunchScript = Get-EnvOrDefault 'GEMMA_LAUNCH_SCRIPT'  (Join-Path $Root '.llama-launch.cmd')
 $RuntimeState = Get-EnvOrDefault 'GOBBONET_RUNTIME_STATE' ''
+$LlmOwnershipMarker = ''
+if (-not [string]::IsNullOrWhiteSpace($RuntimeState)) {
+    $LlmOwnershipMarker = $RuntimeState + '.llm-owned'
+}
 
 $StatePath    = Join-Path $Root '.gobbonet-state.json'
 $SwapLock     = Join-Path $Root '.swap-in-progress'
@@ -177,30 +181,18 @@ $SwapStatus   = Join-Path $Root '.swap-status.json'
 $ModelsListJs = Join-Path $Root 'models-list.json'
 $ActiveJson   = Join-Path $Root 'active-model.json'
 
-# If launch.bat is supervising this file server, keep the launcher's ownership
-# state accurate when a hot-swap creates a replacement chat llama-server.
-# Standalone fileserver.ps1 runs simply leave RuntimeState empty and no-op.
-function Save-LlmRuntimeOwnership {
-    if ([string]::IsNullOrWhiteSpace($RuntimeState)) { return }
-    if (-not (Test-Path -LiteralPath $RuntimeState)) { return }
+# launch.bat is the sole writer of the shared runtime state file. If a hot-swap
+# replaces a pre-existing chat server, fileserver.ps1 only needs to promote LLM
+# ownership to true. Record that monotonic fact in a separate marker instead of
+# doing a competing read-modify-write of the launcher's state file.
+# Standalone fileserver.ps1 runs simply leave LlmOwnershipMarker empty and no-op.
+function Mark-LlmRuntimeOwnership {
+    if ([string]::IsNullOrWhiteSpace($LlmOwnershipMarker)) { return }
 
     try {
-        $lines = @(Get-Content -LiteralPath $RuntimeState -ErrorAction Stop)
-        $found = $false
-        for ($i = 0; $i -lt $lines.Count; $i++) {
-            if ($lines[$i] -match '^OWN_LLM=(0|1)$') {
-                $lines[$i] = 'OWN_LLM=1'
-                $found = $true
-                break
-            }
-        }
-        if (-not $found) { $lines += 'OWN_LLM=1' }
-
-        $tmp = $RuntimeState + '.fileserver.tmp'
-        [IO.File]::WriteAllLines($tmp, [string[]]$lines, [Text.Encoding]::ASCII)
-        Move-Item -LiteralPath $tmp -Destination $RuntimeState -Force
+        [IO.File]::WriteAllText($LlmOwnershipMarker, '1', [Text.Encoding]::ASCII)
     } catch {
-        Write-Host ("[runtime] could not update launcher ownership state: {0}" -f $_.Exception.Message)
+        Write-Host ("[runtime] could not mark launcher LLM ownership: {0}" -f $_.Exception.Message)
     }
 }
 
@@ -1678,7 +1670,9 @@ function Handle-SwapModel {
         # a fresh window with its own console host and detaches cleanly,
         # which is the same recipe launch.bat uses at boot.
         $startCmd = ('/c start "llama-server" /min "{0}"' -f $LaunchScript)
-        Save-LlmRuntimeOwnership
+        # Mark ownership before dispatch so any replacement started by this
+        # swap is classified as launcher-owned by the watchdog.
+        Mark-LlmRuntimeOwnership
         Start-Process -FilePath 'cmd.exe' `
                       -ArgumentList $startCmd `
                       -WindowStyle Hidden `

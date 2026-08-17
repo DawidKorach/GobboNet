@@ -22,6 +22,10 @@ function Env([string]$Name, $Default = '') {
 
 $ParentPid = [int](Env 'GOBBONET_PARENT_PID' '0')
 $StateFile = Env 'GOBBONET_RUNTIME_STATE'
+$LlmOwnershipMarker = ''
+if ($StateFile) {
+	$LlmOwnershipMarker = $StateFile + '.llm-owned'
+}
 $Root = [IO.Path]::GetFullPath((Env 'GOBBONET_ROOT' (Split-Path -Parent $MyInvocation.MyCommand.Path))).TrimEnd('\')
 $RootPrefix = $Root + '\'
 $LlmPort = [int](Env 'GOBBONET_LLM_PORT' '11437')
@@ -49,14 +53,19 @@ function Test-ParentAlive {
 function Read-Ownership {
 	$o = @{ LLM = $false; EMBED = $false; SEARCH = $false; WEB = $false }
 
-	if (-not $StateFile -or -not (Test-Path -LiteralPath $StateFile)) {
-		return $o
+	if ($StateFile -and (Test-Path -LiteralPath $StateFile)) {
+		foreach ($line in (Get-Content -LiteralPath $StateFile -ErrorAction SilentlyContinue)) {
+			if ($line -match '^OWN_(LLM|EMBED|SEARCH|WEB)=(1|0)$') {
+				$o[$Matches[1]] = ($Matches[2] -eq '1')
+			}
+		}
 	}
 
-	foreach ($line in (Get-Content -LiteralPath $StateFile -ErrorAction SilentlyContinue)) {
-		if ($line -match '^OWN_(LLM|EMBED|SEARCH|WEB)=(1|0)$') {
-			$o[$Matches[1]] = ($Matches[2] -eq '1')
-		}
+	# Hot-swaps can promote LLM ownership after launch.bat wrote the shared
+	# state. The marker is monotonic and has a single writer, so no cross-process
+	# read-modify-write is required.
+	if ($LlmOwnershipMarker -and (Test-Path -LiteralPath $LlmOwnershipMarker)) {
+		$o.LLM = $true
 	}
 
 	return $o
@@ -190,6 +199,9 @@ foreach ($p in $procs) {
 
 if ($StateFile) {
 	Remove-Item -LiteralPath $StateFile -Force -ErrorAction SilentlyContinue
+}
+if ($LlmOwnershipMarker) {
+	Remove-Item -LiteralPath $LlmOwnershipMarker -Force -ErrorAction SilentlyContinue
 }
 
 Log 'cleanup complete'

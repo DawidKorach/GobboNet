@@ -431,6 +431,10 @@ set "OWN_SEARCH=0"
 set "OWN_WEB=0"
 set "RUNTIME_STATE="
 if defined LAUNCHER_PID set "RUNTIME_STATE=%~dp0.gobbonet-runtime-!LAUNCHER_PID!.state"
+:: A hot-swap may leave a monotonic LLM-ownership marker if the watchdog was
+:: interrupted before cleanup. PID reuse is possible, so clear any stale marker
+:: before this launcher instance begins recording ownership.
+if defined RUNTIME_STATE if exist "!RUNTIME_STATE!.llm-owned" del /f /q "!RUNTIME_STATE!.llm-owned" >nul 2>&1
 call :write_runtime_state
 call :start_runtime_watchdog
 
@@ -2147,7 +2151,23 @@ if not defined RUNTIME_STATE exit /b
     echo OWN_SEARCH=!OWN_SEARCH!
     echo OWN_WEB=!OWN_WEB!
 )
-move /y "!RUNTIME_STATE!.tmp" "!RUNTIME_STATE!" >nul 2>&1
+:: launch.bat is the sole writer of the state file. Keep the atomic replace,
+:: but retry transient Windows/antivirus locks instead of silently losing an
+:: ownership update that the watchdog will need after this process exits.
+set "RUNTIME_STATE_UPDATED="
+for /l %%R in (1,1,5) do if not defined RUNTIME_STATE_UPDATED (
+    move /y "!RUNTIME_STATE!.tmp" "!RUNTIME_STATE!" >nul 2>&1
+    if not errorlevel 1 (
+        set "RUNTIME_STATE_UPDATED=1"
+    ) else if %%R lss 5 (
+        timeout /t 1 /nobreak >nul 2>&1
+    )
+)
+if not defined RUNTIME_STATE_UPDATED (
+    echo  [*] Could not update runtime ownership state; automatic cleanup may be incomplete.
+    del /f /q "!RUNTIME_STATE!.tmp" >nul 2>&1
+)
+set "RUNTIME_STATE_UPDATED="
 exit /b
 
 :start_runtime_watchdog
