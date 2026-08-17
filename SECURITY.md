@@ -26,8 +26,8 @@ machine can reach it regardless.
 
 | Port | Bound to | Purpose |
 |---|---|---|
-| 8080 | `+` (all interfaces) after `setup-lan.bat`, else `127.0.0.1` | the chat UI |
-| 11434 | `127.0.0.1` | llama-server |
+| 8420 (default) | `+` (all interfaces) after `setup-lan.bat`, else `127.0.0.1` | the chat UI |
+| 11437 (default) | `127.0.0.1` | llama-server |
 | 11435 | `127.0.0.1` | search proxy |
 | 11436 | `127.0.0.1` | embedding server |
 
@@ -35,7 +35,7 @@ machine can reach it regardless.
 wider internet cannot reach any of it. Only the machines on your own network
 can, and only with the password.
 
-**Do not port-forward 8080.** Nothing here is built to face the internet:
+**Do not port-forward the GobboNet UI port (8420 by default).** Nothing here is built to face the internet:
 there is no rate limiting, no TLS, and no account system.
 
 ---
@@ -62,7 +62,7 @@ plain scripts and one web page.
 Two places, and both matter if you are handling anything sensitive:
 
 1. **The browser**, in localStorage/IndexedDB keyed to the address you
-   opened. Every address is separate — `127.0.0.1:8080`, `localhost:8080`,
+   opened. Every address is separate — `127.0.0.1:8420`, `localhost:8420`,
    your `.local` name, any LAN IP — and a phone that connected keeps its own
    copy.
 2. **`.gobbonet-state.json`** in the install folder, mirrored by the file

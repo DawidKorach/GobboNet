@@ -278,7 +278,7 @@ async function onHeaderModelChange(sel) {
 
   // file:// has no fileserver. Tell the user and revert.
   if (!IS_SERVED) {
-    showModelSwitchToast('Hot-swap needs the file server. Open via http://...:8080', 'warn');
+    showModelSwitchToast('Hot-swap needs the file server. Open the HTTP URL shown by launch.bat.', 'warn');
     if (_currentModelFile) sel.value = _currentModelFile;
     return;
   }

@@ -157,7 +157,7 @@
         <span id="search-test-status" style="font-size:12px;color:var(--cyan-dim);"></span>
       </div>
       <pre id="search-test-output" style="display:none; margin-top:8px; max-height:200px; overflow:auto; font-size:11px; padding:8px; background:var(--black); border:1px solid var(--border); border-radius:var(--radius); color:var(--cyan-mid);"></pre>
-      <div class="form-hint">Free key from ollama.com/settings/keys. Search proxy on :11435 is started by launch.bat. Note: the search proxy is the ONLY network traffic — llama.cpp itself is fully offline.</div>
+      <div class="form-hint">Free key from ollama.com/settings/keys. The loopback search proxy is started by launch.bat. Note: the search proxy is the ONLY network traffic — llama.cpp itself is fully offline.</div>
     </div>
 
 
@@ -181,7 +181,7 @@
       <div class="form-hint" style="color:var(--green-dim);">
         llama.cpp runs 100% offline — no accounts, no telemetry, no network calls.
         Your model and conversations never leave your machine.
-        The only network traffic is the optional web search proxy (port 11435),
+        The only network traffic is the optional loopback web-search proxy,
         which you control via the search toggle.
       </div>
     </div>

@@ -11,7 +11,7 @@
    but this stamp still shows the old date, you're on a cached
    copy — hard-refresh (Ctrl+Shift+R) to bust it.
 ================================================================ */
-const CHAT_HTML_BUILD = '1.5.4-fileserver-diagnostics';
+const CHAT_HTML_BUILD = '1.5.5-port-lifecycle-fixes';
 console.log(`%c[chat.html build] ${CHAT_HTML_BUILD}`, 'color:#0a0;font-weight:bold');
 
 /* ================================================================
@@ -23,7 +23,7 @@ console.log(`%c[chat.html build] ${CHAT_HTML_BUILD}`, 'color:#0a0;font-weight:bo
 // If served over HTTP (via file server), route through same-origin proxy to avoid CORS.
 // The file server reverse-proxies /llm/* → llama-server and /search/* → search proxy.
 const IS_SERVED = window.location.protocol.startsWith('http');
-const LLAMA_URL = IS_SERVED ? window.location.origin + '/llm' : 'http://127.0.0.1:11434';
+const LLAMA_URL = IS_SERVED ? window.location.origin + '/llm' : 'http://127.0.0.1:11437';
 /* ================================================================
    MODEL REGISTRY
    Maps model IDs (matching active-model.json) to display metadata.

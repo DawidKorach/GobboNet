@@ -3,7 +3,7 @@
 #
 # Responsibilities:
 #   1. Serve static files (chat.html, style.css, active-model.json, models-list.json, etc.)
-#      from the project root on http://+:8080/.
+#      from the project root on the configured HTTP listen port.
 #   2. Reverse-proxy /llm/*    -> http://127.0.0.1:$LlmPort     (llama-server)
 #                   /search/*  -> http://127.0.0.1:$SearchPort  (Ollama search proxy)
 #                   /embed/*   -> http://127.0.0.1:$EmbedPort   (embedding llama-server, optional)
@@ -46,16 +46,15 @@ function Get-EnvOrDefault {
 }
 
 $Root         = Get-EnvOrDefault 'GEMMA_ROOT'           (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$LlmPort      = [int](Get-EnvOrDefault 'GEMMA_LLM_PORT'      '11434')
+$LlmPort      = [int](Get-EnvOrDefault 'GEMMA_LLM_PORT'      '11437')
 $SearchPort   = [int](Get-EnvOrDefault 'GEMMA_SEARCH_PORT'   '11435')
 # Embedding service (RAG Retriever A). Optional infra: if it's down, the
 # /embed proxy below returns 502 and chat.html degrades to tag-only retrieval.
 $EmbedPort    = [int](Get-EnvOrDefault 'GEMMA_EMBED_PORT'    '11436')
-# Listen port and prefix, overridable from launch.bat. 8080 is one of the
-# most contended ports on a developer machine -- Hyper-V, WSL2, Docker and
-# the Windows NAT service all reserve blocks around it -- so a user who
-# cannot bind it needs a way out that is not "edit the source".
-$ListenPort   = [int]$(if ($env:GEMMA_LISTEN_PORT) { $env:GEMMA_LISTEN_PORT } else { '8080' })
+# Listen port and prefix, overridable from launch.bat. 8420 is the default
+# to avoid common collisions on developer machines (8080 is frequently used
+# by Apache/IIS/dev servers and may also land in a reserved Windows range).
+$ListenPort   = [int]$(if ($env:GEMMA_LISTEN_PORT) { $env:GEMMA_LISTEN_PORT } else { '8420' })
 $ListenPrefix = $(if ($env:GEMMA_LISTEN_PREFIX) { $env:GEMMA_LISTEN_PREFIX } else { 'http://+:{0}/' -f $ListenPort })
 
 # ---------------------------------------------------------------------------
@@ -103,7 +102,7 @@ $Script:JobWorkers = @{}  # jobId -> @{ PS; Handle; Runspace } for live runspace
 
 # --- Access control ----------------------------------------------------------
 # A single shared password gates the whole server. Anyone on the LAN can REACH
-# port 8080 (the firewall only restricts to LocalSubnet), so a roommate, guest,
+# the UI port (the firewall only restricts it to LocalSubnet), so a roommate, guest,
 # or compromised IoT device on the same Wi-Fi could otherwise read/write chats,
 # drive the GPU, and swap models. Requiring a password closes that gap.
 #
@@ -1143,22 +1142,25 @@ function Build-LaunchScript {
     return "@echo off`r`n" + $auditPrelude + "`r`n" + $line + "`r`n"
 }
 
-# Stop the currently-running llama-server process(es). We match by image
-# name because the process is started detached and we don't always have a
-# PID to wait on. Any process named "llama-server" is fair game.
+# Stop only the llama-server configured for the main LLM port. GobboNet also
+# runs a second llama-server for embeddings, so killing by image name would
+# silently take RAG down on every model hot-swap (and could kill unrelated
+# llama.cpp instances). Match the --port argument in the process command line.
 #
 # CRITICAL: Stop-Process returns before Windows has actually released the
-# listening socket on port 11434. If we spawn the replacement before that,
+# listening socket on the configured LLM port. If we spawn the replacement before that,
 # the new server's bind() fails and it exits silently within ~50ms --
 # /swap-status then sits at "starting" until the 180s timeout, which looks
 # like the model is loading when really it's already dead. So we poll the
 # port itself and only return once nothing is listening, plus a small grace
 # margin to make sure the kernel-side cleanup is done.
 function Stop-LlamaServer {
-    $procs = @(Get-Process -Name 'llama-server' -ErrorAction SilentlyContinue)
+    $portRx = '(?i)(?:--port\s+|--port=)' + [regex]::Escape([string]$LlmPort) + '(?:\s|$)'
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='llama-server.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { [string]$_.CommandLine -match $portRx })
     foreach ($p in $procs) {
         try {
-            $p | Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         } catch { }
     }
 
@@ -1525,7 +1527,7 @@ try {
         Say  "        Checklist, in order of likelihood:" 'Red'
         Say ("          1. netsh interface ipv4 show excludedportrange protocol=tcp") 'Red'
         Say ("             Is {0} inside a reserved range? Hyper-V, WSL2 and Docker" -f $ListenPort) 'Red'
-        Say  "             reserve blocks around 8080. netstat cannot see these." 'Red'
+        Say  "             reserve dynamic port blocks. netstat cannot see these." 'Red'
         Say ("          2. netsh http show urlacl url={0}" -f $ListenPrefix) 'Red'
         Say  "             Missing URL ACL -- this is the one setup-lan.bat fixes." 'Red'
         Say  "          3. netsh http show servicestate" 'Red'
@@ -1567,11 +1569,16 @@ while ($listener.IsListening) {
         $path = $request.Url.AbsolutePath
 
         # --- Auth gate -------------------------------------------------------
-        # A few routes are reachable without a session: the login page/handler,
-        # logout, OPTIONS preflight (already handled above), and the favicon
-        # (so the login tab isn't ugly). Everything else requires a valid
-        # session cookie.
-        if ($path -eq '/login') {
+        # Health must be reachable without a session so launch.bat can verify
+        # service identity before opening the browser. The response includes a
+        # GobboNet-specific marker; this prevents an unrelated server on the
+        # same port from being accepted as our file server.
+        if ($path -eq '/health-fileserver') {
+            Write-Json $response 200 @{ status = 'ok'; service = 'gobbonet-fileserver'; pid = $PID; hotswap = $HotSwapEnabled }
+        }
+        # A few other routes are reachable without a session: the login
+        # page/handler, logout, OPTIONS preflight, and the favicon.
+        elseif ($path -eq '/login') {
             if ($request.HttpMethod -eq 'POST') {
                 $body = ''
                 if ($request.HasEntityBody) {
@@ -1640,9 +1647,6 @@ while ($listener.IsListening) {
         # --- Routing ---------------------------------------------------------
         # Order matters: more-specific prefixes must come before catch-alls.
 
-        elseif ($path -eq '/health-fileserver') {
-            Write-Json $response 200 @{ status = 'ok'; pid = $PID; hotswap = $HotSwapEnabled }
-        }
         elseif ($path -eq '/state' -or $path -like '/state/*') {
             Handle-State -Request $request -Response $response
         }

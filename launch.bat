@@ -1,19 +1,26 @@
 @echo off
 :: ---------------------------------------------------------------
-:: KEEP-OPEN GUARD -- this window can NEVER silently vanish.
-:: If anything fails (a crash, a blocked tool, a bad path, even a
-:: stray syntax error), the message stays on screen instead of the
-:: window closing too fast to read. We relaunch ourselves once
-:: inside "cmd /k", which holds the window open at a prompt no
-:: matter how the script exits. The env var is inherited by the
-:: relaunch, so this happens exactly once and then never again.
+:: KEEP-OPEN / LIFECYCLE GUARD.
+:: Relaunch once in a dedicated `cmd /c` process. Older builds used
+:: `cmd /k`; after Ctrl+C that shell stayed alive at a prompt, so the
+:: detached file/search servers had no reliable lifetime boundary and
+:: could remain registered in HTTP.sys. With /c, terminating the batch
+:: also terminates this inner cmd process. runtime-watchdog.ps1 watches
+:: that PID and cleans up only services this launch instance spawned.
 :: ---------------------------------------------------------------
 if not defined GOBBONET_KEEPOPEN (
     set "GOBBONET_KEEPOPEN=1"
-    cmd /k ""%~f0" %*"
+    cmd /c ""%~f0" %*"
+    set "GOBBONET_KEEPOPEN="
     exit /b
 )
 setlocal EnableDelayedExpansion
+
+:: PID of the dedicated cmd.exe that is executing this batch. A PowerShell
+:: child can ask Windows for its parent PID; that parent is this cmd.exe.
+:: The runtime watchdog uses it as the authoritative lifetime boundary.
+set "LAUNCHER_PID="
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$p=(Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID)).ParentProcessId; [Console]::Write($p)" 2^>nul`) do set "LAUNCHER_PID=%%P"
 title Gobbonet - Local AI Chat [llama.cpp]
 color 0A
 
@@ -112,17 +119,24 @@ if not defined HAVE_CERTUTIL (
 :: ===============================================================
 :: CONFIG - edit these if you want a different model or port
 :: ===============================================================
-set "SERVER_PORT=11434"
-:: Web UI port. Overridable because 8080 is one of the most contended
-:: ports on a Windows machine -- Hyper-V, WSL2, Docker Desktop and the
-:: Windows NAT service all reserve blocks around it, and a reserved port
-:: refuses to bind even when nothing is using it and even when elevated.
-:: fileserver.ps1 reads GEMMA_LISTEN_PORT, so set it before launching:
-::     set GEMMA_LISTEN_PORT=8420 && launch.bat
+:: Keep llama.cpp away from Ollama's standard local port (11434).
+:: Every service port can be overridden from the environment without
+:: editing this file. Example (PowerShell):
+::   $env:GEMMA_LISTEN_PORT='8420'; $env:GEMMA_LLM_PORT='11437'; .\launch.bat
+if defined GEMMA_LLM_PORT (
+    set "SERVER_PORT=!GEMMA_LLM_PORT!"
+) else (
+    set "SERVER_PORT=11437"
+)
+if defined GEMMA_SEARCH_PORT (
+    set "SEARCH_PORT=!GEMMA_SEARCH_PORT!"
+) else (
+    set "SEARCH_PORT=11435"
+)
 if defined GEMMA_LISTEN_PORT (
     set "WEB_PORT=!GEMMA_LISTEN_PORT!"
 ) else (
-    set "WEB_PORT=8080"
+    set "WEB_PORT=8420"
 )
 set "CTX_SIZE=16384"
 set "GPU_LAYERS=99"
@@ -131,8 +145,8 @@ set "KV_CACHE_TYPE=q8_0"
 :: ---------------------------------------------------------------
 :: SECURITY -- access password (hashed, set by you on first run)
 ::
-:: The web UI is password-gated: anyone on your Wi-Fi can reach port
-:: 8080, so without a password a roommate/guest/IoT device could read
+:: The web UI is password-gated: anyone on your Wi-Fi can reach the UI
+:: port, so without a password a roommate/guest/IoT device could read
 :: your chats and use your GPU.
 ::
 :: There is NO password baked into this file. On first run you choose
@@ -332,7 +346,11 @@ set "MODEL_GGUF="
 :: bge-small-en; if you swap models, update EMBED_MODEL_GGUF + URL.
 :: ---------------------------------------------------------------
 set "EMBED_ENABLE=1"
-set "EMBED_PORT=11436"
+if defined GEMMA_EMBED_PORT (
+    set "EMBED_PORT=!GEMMA_EMBED_PORT!"
+) else (
+    set "EMBED_PORT=11436"
+)
 set "EMBED_CTX=2048"
 set "EMBED_GPU_LAYERS=0"
 set "EMBED_MODEL_GGUF=nomic-embed-text-v1.5.Q8_0.gguf"
@@ -344,6 +362,18 @@ set "EMBED_MODEL_URL=https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/
 set "EMBED_PIN_SHA256="
 set "EMBED_LOG_FILE=%~dp0embed-server.log"
 set "EMBED_LAUNCH_SCRIPT=%~dp0.embed-launch.cmd"
+
+:: Runtime ownership flags. The watchdog only terminates processes that this
+:: invocation actually spawned, so a separately-started compatible server is
+:: never killed just because it happens to use the same port.
+set "OWN_LLM=0"
+set "OWN_EMBED=0"
+set "OWN_SEARCH=0"
+set "OWN_WEB=0"
+set "RUNTIME_STATE="
+if defined LAUNCHER_PID set "RUNTIME_STATE=%~dp0.gobbonet-runtime-!LAUNCHER_PID!.state"
+call :write_runtime_state
+call :start_runtime_watchdog
 
 goto :main
 
@@ -1288,11 +1318,29 @@ echo.
 :start_server
 echo  [..] Checking for running llama-server...
 
-call :http_probe "http://127.0.0.1:!SERVER_PORT!/health"
+call :http_health "http://127.0.0.1:!SERVER_PORT!/health"
 if not errorlevel 1 (
-    echo  [OK] llama-server already running on port !SERVER_PORT!
+    set "SERVER_PREEXISTING=1"
+    echo  [OK] Compatible llama-server already running on port !SERVER_PORT!
     goto :verify_gpu
 )
+
+:: A listener that is NOT a healthy llama-server is a real conflict. Older
+:: builds treated any HTTP response (including Ollama's 404 on /health) as
+:: success and then entered an endless restart/bind-failure loop.
+call :tcp_probe !SERVER_PORT!
+if not errorlevel 1 (
+    echo.
+    echo  [ERROR] Port !SERVER_PORT! is already in use, but the service there
+    echo          is not a healthy llama-server.
+    echo.
+    echo          If Ollama is running, keep it on its normal 11434 and let
+    echo          GobboNet use the default 11437. To choose another port:
+    echo            set GEMMA_LLM_PORT=11437
+    echo.
+    goto :fatal
+)
+set "SERVER_PREEXISTING=0"
 
 :: Log file for diagnostics - lives next to this script
 echo  [..] Starting llama-server...
@@ -1445,6 +1493,8 @@ if not "!MODEL_CHAT_TEMPLATE_FILE!"=="" (
     echo "!SERVER_EXE!" --model "!GGUF_PATH!" --port !SERVER_PORT! --host 127.0.0.1 --ctx-size !CTX_SIZE! --n-gpu-layers !GPU_LAYERS! --cache-type-k !KV_CACHE_TYPE! --cache-type-v !KV_CACHE_TYPE! --parallel 1 !JINJA_FLAG! !CHAT_TEMPLATE_FLAG! --reasoning-format auto ^> "!LOG_FILE!" 2^>^&1
 )
 
+set "OWN_LLM=1"
+call :write_runtime_state
 start /min "llama-server" "!LAUNCH_SCRIPT!"
 
 echo  [..] Waiting for server to load model...
@@ -1461,7 +1511,7 @@ set /a RETRIES+=1
 :: user wait out the full timeout for a server that is already gone.
 :: (Skip the first few polls so we don't race the process appearing.)
 if !RETRIES! lss 3 goto :wait_poll
-tasklist /fi "imagename eq llama-server.exe" 2>nul | findstr /i "llama-server.exe" >nul
+call :llama_process_exists !SERVER_PORT!
 if errorlevel 1 (
     echo.
     echo  [ERROR] llama-server stopped during startup -- it could not load the model.
@@ -1501,6 +1551,12 @@ echo.
 :: whether inference is running on GPU or stuck on CPU.
 :: ---------------------------------------------------------------
 :verify_gpu
+if "!SERVER_PREEXISTING!"=="1" (
+    echo  [..] Existing llama-server detected; skipping log-based GPU check.
+    echo       llama-server.log may belong to an earlier run, so using it here
+    echo       could falsely report GPU acceleration from stale data.
+    goto :after_gpu_verify
+)
 set "GPU_CONFIRMED=0"
 
 :: Check log for Vulkan or CUDA device detection and successful layer offload
@@ -1538,6 +1594,10 @@ if "!GPU_CONFIRMED!"=="1" (
     if /i "!CONTINUE_CPU!"=="N" goto :fatal
 )
 
+:after_gpu_verify
+:: Check for VRAM pressure warnings only when this launch owns the log.
+if "!SERVER_PREEXISTING!"=="1" goto :after_vram_check
+
 :: Check for VRAM pressure warnings
 if exist "!LOG_FILE!" (
     findstr /i /c:"cannot meet free memory" /c:"failed to fit" "!LOG_FILE!" >nul 2>&1
@@ -1550,6 +1610,7 @@ if exist "!LOG_FILE!" (
         echo       Current CTX_SIZE = !CTX_SIZE!
     )
 )
+:after_vram_check
 echo.
 
 :: ---------------------------------------------------------------
@@ -1566,9 +1627,15 @@ if /i "!EMBED_ENABLE!"=="0" (
     goto :start_proxy
 )
 
-call :http_probe "http://127.0.0.1:!EMBED_PORT!/health"
+call :http_health "http://127.0.0.1:!EMBED_PORT!/health"
 if not errorlevel 1 (
     echo  [OK] Embedding server already on :!EMBED_PORT!
+    goto :start_proxy
+)
+call :tcp_probe !EMBED_PORT!
+if not errorlevel 1 (
+    echo  [*] Port !EMBED_PORT! is occupied by another service -- embedding server skipped.
+    echo      Chat works normally; RAG falls back to tag-only retrieval.
     goto :start_proxy
 )
 
@@ -1627,6 +1694,8 @@ if errorlevel 1 (
     echo "!SERVER_EXE!" --model "!EMBED_PATH!" --port !EMBED_PORT! --host 127.0.0.1 --embeddings --pooling mean --ctx-size !EMBED_CTX! --batch-size !EMBED_CTX! --ubatch-size !EMBED_CTX! --n-gpu-layers !EMBED_GPU_LAYERS! ^> "!EMBED_LOG_FILE!" 2^>^&1
 )
 echo  [..] Starting embedding server on :!EMBED_PORT! ^(CPU^)...
+set "OWN_EMBED=1"
+call :write_runtime_state
 start /min "embed-server" "!EMBED_LAUNCH_SCRIPT!"
 
 set "ERETRIES=0"
@@ -1638,43 +1707,62 @@ if !ERETRIES! gtr 40 (
     goto :start_proxy
 )
 timeout /t 1 /nobreak >nul
-call :http_probe "http://127.0.0.1:!EMBED_PORT!/health"
+call :http_health "http://127.0.0.1:!EMBED_PORT!/health"
 if errorlevel 1 goto :embed_wait
 echo  [OK] Embedding server ready on :!EMBED_PORT!
 echo.
 
 :: ---------------------------------------------------------------
-:: STEP 4: SEARCH PROXY (127.0.0.1:11435 -> ollama.com/api)
-:: The search proxy is independent of the inference backend.
-:: It's a simple HTTP relay so the chat UI can do web searches.
-:: Bound to loopback: only the file server's /search route reaches
-:: it (via 127.0.0.1), so it is not exposed on the LAN and needs no
-:: separate auth. The browser's search Authorization header is
-:: forwarded through the file server proxy to here unchanged.
+:: STEP 4: SEARCH PROXY (loopback -> ollama.com/api)
+:: The old launcher embedded this entire PowerShell service as a Base64
+:: command with port 11435 hard-coded inside it. Keep the proxy in a normal
+:: source file instead so the port is configurable and failures are visible.
 :: ---------------------------------------------------------------
 :start_proxy
 
-call :http_probe "http://127.0.0.1:11435/health"
+call :http_service_health "http://127.0.0.1:!SEARCH_PORT!/health" "gobbonet-search-proxy"
 if not errorlevel 1 (
-    echo  [OK] Search proxy on :11435
+    echo  [OK] Search proxy on :!SEARCH_PORT!
     goto :launch
 )
 
-echo  [..] Starting search proxy on :11435...
-start /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand "JABFAHIAcgBvAHIAQQBjAHQAaQBvAG4AUAByAGUAZgBlAHIAZQBuAGMAZQAgAD0AIAAnAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAJwAKAFsATgBlAHQALgBTAGUAcgB2AGkAYwBlAFAAbwBpAG4AdABNAGEAbgBhAGcAZQByAF0AOgA6AFMAZQBjAHUAcgBpAHQAeQBQAHIAbwB0AG8AYwBvAGwAIAA9ACAAWwBOAGUAdAAuAFMAZQBjAHUAcgBpAHQAeQBQAHIAbwB0AG8AYwBvAGwAVAB5AHAAZQBdADoAOgBUAGwAcwAxADIACgAkAGwAaQBzAHQAZQBuAGUAcgAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0ACAAUwB5AHMAdABlAG0ALgBOAGUAdAAuAEgAdAB0AHAATABpAHMAdABlAG4AZQByAAoAJABsAGkAcwB0AGUAbgBlAHIALgBQAHIAZQBmAGkAeABlAHMALgBBAGQAZAAoACcAaAB0AHQAcAA6AC8ALwAxADIANwAuADAALgAwAC4AMQA6ADEAMQA0ADMANQAvACcAKQAKAHQAcgB5ACAAewAgACQAbABpAHMAdABlAG4AZQByAC4AUwB0AGEAcgB0ACgAKQAgAH0AIABjAGEAdABjAGgAIAB7ACAAZQB4AGkAdAAgADEAIAB9AAoAdwBoAGkAbABlACAAKAAkAGwAaQBzAHQAZQBuAGUAcgAuAEkAcwBMAGkAcwB0AGUAbgBpAG4AZwApACAAewAKACAAIAAkAGMAdAB4ACAAPQAgACQAbABpAHMAdABlAG4AZQByAC4ARwBlAHQAQwBvAG4AdABlAHgAdAAoACkACgAgACAAJAByAGUAcwBwACAAPQAgACQAYwB0AHgALgBSAGUAcwBwAG8AbgBzAGUACgAgACAAJAByAGUAcwBwAC4AQQBkAGQASABlAGEAZABlAHIAKAAnAEEAYwBjAGUAcwBzAC0AQwBvAG4AdAByAG8AbAAtAEEAbABsAG8AdwAtAE8AcgBpAGcAaQBuACcALAAgACcAKgAnACkACgAgACAAJAByAGUAcwBwAC4AQQBkAGQASABlAGEAZABlAHIAKAAnAEEAYwBjAGUAcwBzAC0AQwBvAG4AdAByAG8AbAAtAEEAbABsAG8AdwAtAE0AZQB0AGgAbwBkAHMAJwAsACAAJwBQAE8AUwBUACwAIABHAEUAVAAsACAATwBQAFQASQBPAE4AUwAnACkACgAgACAAJAByAGUAcwBwAC4AQQBkAGQASABlAGEAZABlAHIAKAAnAEEAYwBjAGUAcwBzAC0AQwBvAG4AdAByAG8AbAAtAEEAbABsAG8AdwAtAEgAZQBhAGQAZQByAHMAJwAsACAAJwBDAG8AbgB0AGUAbgB0AC0AVAB5AHAAZQAsACAAQQB1AHQAaABvAHIAaQB6AGEAdABpAG8AbgAnACkACgAgACAAaQBmACAAKAAkAGMAdAB4AC4AUgBlAHEAdQBlAHMAdAAuAEgAdAB0AHAATQBlAHQAaABvAGQAIAAtAGUAcQAgACcATwBQAFQASQBPAE4AUwAnACkAIAB7AAoAIAAgACAAIAAkAHIAZQBzAHAALgBTAHQAYQB0AHUAcwBDAG8AZABlACAAPQAgADIAMAA0ADsAIAAkAHIAZQBzAHAALgBDAGwAbwBzAGUAKAApADsAIABjAG8AbgB0AGkAbgB1AGUACgAgACAAfQAKACAAIAAkAHAAYQB0AGgAIAA9ACAAJABjAHQAeAAuAFIAZQBxAHUAZQBzAHQALgBVAHIAbAAuAEEAYgBzAG8AbAB1AHQAZQBQAGEAdABoAAoAIAAgAGkAZgAgACgAJABwAGEAdABoACAALQBlAHEAIAAnAC8AaABlAGEAbAB0AGgAJwApACAAewAKACAAIAAgACAAJAByAGUAcwBwAC4AUwB0AGEAdAB1AHMAQwBvAGQAZQAgAD0AIAAyADAAMAAKACAAIAAgACAAJABiACAAPQAgAFsAVABlAHgAdAAuAEUAbgBjAG8AZABpAG4AZwBdADoAOgBVAFQARgA4AC4ARwBlAHQAQgB5AHQAZQBzACgAJwB7ACIAcwB0AGEAdAB1AHMAIgA6ACIAbwBrACIAfQAnACkACgAgACAAIAAgACQAcgBlAHMAcAAuAE8AdQB0AHAAdQB0AFMAdAByAGUAYQBtAC4AVwByAGkAdABlACgAJABiACwAIAAwACwAIAAkAGIALgBMAGUAbgBnAHQAaAApADsAIAAkAHIAZQBzAHAALgBDAGwAbwBzAGUAKAApADsAIABjAG8AbgB0AGkAbgB1AGUACgAgACAAfQAKACAAIAB0AHIAeQAgAHsACgAgACAAIAAgACQAcwByACAAPQAgAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABJAE8ALgBTAHQAcgBlAGEAbQBSAGUAYQBkAGUAcgAoACQAYwB0AHgALgBSAGUAcQB1AGUAcwB0AC4ASQBuAHAAdQB0AFMAdAByAGUAYQBtACkACgAgACAAIAAgACQAYgBvAGQAeQAgAD0AIAAkAHMAcgAuAFIAZQBhAGQAVABvAEUAbgBkACgAKQA7ACAAJABzAHIALgBDAGwAbwBzAGUAKAApAAoAIAAgACAAIAAkAHQAYQByAGcAZQB0AFUAcgBsACAAPQAgACcAaAB0AHQAcABzADoALwAvAG8AbABsAGEAbQBhAC4AYwBvAG0ALwBhAHAAaQAnACAAKwAgACQAcABhAHQAaAAKACAAIAAgACAAJABoAGUAYQBkAGUAcgBzACAAPQAgAEAAewAgACcAQwBvAG4AdABlAG4AdAAtAFQAeQBwAGUAJwAgAD0AIAAnAGEAcABwAGwAaQBjAGEAdABpAG8AbgAvAGoAcwBvAG4AJwAgAH0ACgAgACAAIAAgACQAYQB1AHQAaAAgAD0AIAAkAGMAdAB4AC4AUgBlAHEAdQBlAHMAdAAuAEgAZQBhAGQAZQByAHMAWwAnAEEAdQB0AGgAbwByAGkAegBhAHQAaQBvAG4AJwBdAAoAIAAgACAAIABpAGYAIAAoACQAYQB1AHQAaAApACAAewAgACQAaABlAGEAZABlAHIAcwBbACcAQQB1AHQAaABvAHIAaQB6AGEAdABpAG8AbgAnAF0AIAA9ACAAJABhAHUAdABoACAAfQAKACAAIAAgACAAJAB3AHIAIAA9ACAASQBuAHYAbwBrAGUALQBXAGUAYgBSAGUAcQB1AGUAcwB0ACAALQBVAHIAaQAgACQAdABhAHIAZwBlAHQAVQByAGwAIAAtAE0AZQB0AGgAbwBkACAAUABPAFMAVAAgAC0AQgBvAGQAeQAgACQAYgBvAGQAeQAgAC0ASABlAGEAZABlAHIAcwAgACQAaABlAGEAZABlAHIAcwAgAC0AVQBzAGUAQgBhAHMAaQBjAFAAYQByAHMAaQBuAGcAIAAtAFQAaQBtAGUAbwB1AHQAUwBlAGMAIAAzADAACgAgACAAIAAgACQAcgBlAHMAcAAuAEMAbwBuAHQAZQBuAHQAVAB5AHAAZQAgAD0AIAAnAGEAcABwAGwAaQBjAGEAdABpAG8AbgAvAGoAcwBvAG4AJwAKACAAIAAgACAAJABvAGIAIAA9ACAAWwBUAGUAeAB0AC4ARQBuAGMAbwBkAGkAbgBnAF0AOgA6AFUAVABGADgALgBHAGUAdABCAHkAdABlAHMAKAAkAHcAcgAuAEMAbwBuAHQAZQBuAHQAKQAKACAAIAAgACAAJAByAGUAcwBwAC4ATwB1AHQAcAB1AHQAUwB0AHIAZQBhAG0ALgBXAHIAaQB0AGUAKAAkAG8AYgAsACAAMAAsACAAJABvAGIALgBMAGUAbgBnAHQAaAApAAoAIAAgAH0AIABjAGEAdABjAGgAIAB7AAoAIAAgACAAIAAkAHIAZQBzAHAALgBTAHQAYQB0AHUAcwBDAG8AZABlACAAPQAgADUAMAAyAAoAIAAgACAAIAAkAGUAbQAgAD0AIAAnAHsAIgBlAHIAcgBvAHIAIgA6ACIAcAByAG8AeAB5ADoAIAAnACAAKwAgACQAXwAuAEUAeABjAGUAcAB0AGkAbwBuAC4ATQBlAHMAcwBhAGcAZQAuAFIAZQBwAGwAYQBjAGUAKAAnACIAJwAsACcAJwApAC4AUgBlAHAAbABhAGMAZQAoACIAYAByACIALAAnACcAKQAuAFIAZQBwAGwAYQBjAGUAKAAiAGAAbgAiACwAJwAgACcAKQAgACsAIAAnACIAfQAnAAoAIAAgACAAIAAkAGUAYgAgAD0AIABbAFQAZQB4AHQALgBFAG4AYwBvAGQAaQBuAGcAXQA6ADoAVQBUAEYAOAAuAEcAZQB0AEIAeQB0AGUAcwAoACQAZQBtACkACgAgACAAIAAgACQAcgBlAHMAcAAuAE8AdQB0AHAAdQB0AFMAdAByAGUAYQBtAC4AVwByAGkAdABlACgAJABlAGIALAAgADAALAAgACQAZQBiAC4ATABlAG4AZwB0AGgAKQAKACAAIAB9AAoAIAAgACQAcgBlAHMAcAAuAEMAbABvAHMAZQAoACkACgB9AAoA"
+call :tcp_probe !SEARCH_PORT!
+if not errorlevel 1 (
+    echo  [*] Port !SEARCH_PORT! is occupied by another or unhealthy service.
+    echo      Web search will be disabled; chat still works normally.
+    echo      Set GEMMA_SEARCH_PORT to another free port if needed.
+    goto :launch
+)
+
+if not exist "%~dp0searchproxy.ps1" (
+    echo  [*] searchproxy.ps1 not found -- web search will not work.
+    goto :launch
+)
+
+echo  [..] Starting search proxy on :!SEARCH_PORT!...
+set "GEMMA_ROOT=%~dp0."
+set "GEMMA_SEARCH_PORT=!SEARCH_PORT!"
+set "OWN_SEARCH=1"
+call :write_runtime_state
+start /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0searchproxy.ps1"
 
 set "PRETRIES=0"
 :proxy_wait
 set /a PRETRIES+=1
 if !PRETRIES! gtr 10 (
     echo  [*] Search proxy failed. Web search will not work.
+    if exist "%~dp0search-proxy.log" (
+        echo      --- search-proxy.log -----------------------------------
+        type "%~dp0search-proxy.log"
+        echo      -------------------------------------------------------
+    )
     echo      Chat still functions normally without search.
     goto :launch
 )
 timeout /t 1 /nobreak >nul
-call :http_probe "http://127.0.0.1:11435/health"
+call :http_service_health "http://127.0.0.1:!SEARCH_PORT!/health" "gobbonet-search-proxy"
 if errorlevel 1 goto :proxy_wait
-echo  [OK] Search proxy on :11435
+echo  [OK] Search proxy on :!SEARCH_PORT!
 echo.
 
 :: ---------------------------------------------------------------
@@ -1687,12 +1775,25 @@ if not exist "%~dp0chat.html" (
     goto :fatal
 )
 
-:: Start a lightweight HTTP file server on port 8080
-:: This lets your phone load chat.html over the network
-call :http_probe "http://127.0.0.1:!WEB_PORT!/"
+:: Start the HTTP file server. Probe its dedicated unauthenticated health
+:: endpoint, not merely "did anything answer on this port". That distinction
+:: prevents IIS/Apache/EDB/etc. from being mistaken for GobboNet.
+call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver"
 if not errorlevel 1 (
     echo  [OK] File server already running on :!WEB_PORT!
     goto :get_lan_ip
+)
+call :tcp_probe !WEB_PORT!
+if not errorlevel 1 (
+    echo.
+    echo  [ERROR] Port !WEB_PORT! is already in use by another service.
+    echo          GobboNet will NOT open that service in your browser.
+    echo.
+    echo          Choose a free UI port, for example:
+    echo            set GEMMA_LISTEN_PORT=8420
+    echo          then run launch.bat again from the same terminal.
+    echo.
+    goto :fatal
 )
 
 echo  [..] Starting file server on :!WEB_PORT!...
@@ -1706,7 +1807,7 @@ if not exist "%~dp0fileserver.ps1" (
 )
 set "GEMMA_ROOT=%~dp0."
 set "GEMMA_LLM_PORT=!SERVER_PORT!"
-set "GEMMA_SEARCH_PORT=11435"
+set "GEMMA_SEARCH_PORT=!SEARCH_PORT!"
 set "GEMMA_EMBED_PORT=!EMBED_PORT!"
 :: Extra env vars the file server needs to spawn a replacement
 :: llama-server during a hot-swap. fileserver.ps1 reads these once at
@@ -1721,6 +1822,8 @@ set "GEMMA_KV_CACHE_TYPE=!KV_CACHE_TYPE!"
 set "GEMMA_LOG_FILE=!LOG_FILE!"
 set "GEMMA_LAUNCH_SCRIPT=!LAUNCH_SCRIPT!"
 set "GEMMA_ACCESS_SECRET=!ACCESS_SECRET!"
+set "OWN_WEB=1"
+call :write_runtime_state
 start /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0fileserver.ps1"
 
 set "FRETRIES=0"
@@ -1760,7 +1863,7 @@ if !FRETRIES! gtr 8 (
     goto :get_lan_ip
 )
 timeout /t 1 /nobreak >nul
-call :http_probe "http://127.0.0.1:!WEB_PORT!/"
+call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver"
 if errorlevel 1 goto :fserver_wait
 echo  [OK] File server on :!WEB_PORT!
 
@@ -1788,7 +1891,7 @@ set "LAN_IP=<could not detect>"
 :: The hostname URL is preferred because it's STABLE across IP
 :: rotations: the browser keys localStorage by origin, and the
 :: hostname stays the same even when the LAN IP changes. Users
-:: who bookmark <hostname>.local:8080 won't lose their chats when
+:: who bookmark <hostname>.local:<port> won't lose their chats when
 :: their PC's DHCP lease rolls over.
 :: ---------------------------------------------------------------
 set "LAN_HOST=!COMPUTERNAME!"
@@ -1846,11 +1949,11 @@ echo   Ready! Opening chat in your browser.
 echo.
 if "!IP_CHANGED!"=="1" (
     echo   [*] LAN IP CHANGED since last launch!
-    echo       Previous: http://!PREV_LAN_IP!:8080
-    echo       Current:  http://!LAN_IP!:8080
+    echo       Previous: http://!PREV_LAN_IP!:!WEB_PORT!
+    echo       Current:  http://!LAN_IP!:!WEB_PORT!
     echo.
     if "!MDNS_OK!"=="1" (
-        echo       TIP: Bookmark http://!LAN_HOST!.local:8080
+        echo       TIP: Bookmark http://!LAN_HOST!.local:!WEB_PORT!
         echo       on your phone instead - that URL stays the
         echo       same even when the IP rotates.
     ) else (
@@ -1867,16 +1970,16 @@ echo                   search icon in chat
 echo     No accounts, no API keys, no tracking.
 echo.
 echo   LAN ACCESS (same Wi-Fi / network):
-echo     On this PC:    http://127.0.0.1:8080
+echo     On this PC:    http://127.0.0.1:!WEB_PORT!
 if "!MDNS_OK!"=="1" (
-    echo     On your phone: http://!LAN_HOST!.local:8080  [stable, recommended]
-    echo                or  http://!LAN_IP!:8080          [also works]
+    echo     On your phone: http://!LAN_HOST!.local:!WEB_PORT!  [stable, recommended]
+    echo                or  http://!LAN_IP!:!WEB_PORT!          [also works]
     echo.
     echo     The .local URL is preferred - it survives IP changes,
     echo     so your bookmarks never break. Works on Android 12+
     echo     and any iPhone or iPad without extra setup.
 ) else (
-    echo     On your phone: http://!LAN_IP!:8080
+    echo     On your phone: http://!LAN_IP!:!WEB_PORT!
     echo.
     echo     [*] mDNS not responding on this PC. The .local
     echo         hostname can't be used until that's fixed -
@@ -1902,11 +2005,12 @@ echo   This window will minimize in 8 seconds.
 echo   It monitors server health in the background.
 echo.
 echo   To shut down: restore this window and press Ctrl+C,
-echo   or simply close it.
+echo   or simply close it. Services started by this launch are
+echo   cleaned up by runtime-watchdog.ps1.
 echo  ====================================================
 echo.
 
-start "" "http://127.0.0.1:8080"
+start "" "http://127.0.0.1:!WEB_PORT!"
 
 :: Pause longer on IP change so the user actually reads the warning
 if "!IP_CHANGED!"=="1" (
@@ -1944,11 +2048,13 @@ if exist "!SWAP_LOCK!" (
 call :restore_window
 echo.
 echo  [*] %TIME% - llama-server stopped responding!
-echo  [..] Killing any stale llama-server process...
-taskkill /f /im llama-server.exe >nul 2>&1
+echo  [..] Killing stale llama-server on port !SERVER_PORT!...
+call :kill_llama_on_port !SERVER_PORT!
 timeout /t 3 /nobreak >nul
 
 echo  [..] Restarting llama-server...
+set "OWN_LLM=1"
+call :write_runtime_state
 start /min "llama-server" "!LAUNCH_SCRIPT!"
 
 echo  [..] Waiting for server to come back up...
@@ -1980,6 +2086,36 @@ goto :monitor_loop
 :: ===============================================================
 :: UTILITY SUBROUTINES
 :: ===============================================================
+:write_runtime_state
+if not defined RUNTIME_STATE exit /b
+> "!RUNTIME_STATE!.tmp" (
+    echo OWN_LLM=!OWN_LLM!
+    echo OWN_EMBED=!OWN_EMBED!
+    echo OWN_SEARCH=!OWN_SEARCH!
+    echo OWN_WEB=!OWN_WEB!
+)
+move /y "!RUNTIME_STATE!.tmp" "!RUNTIME_STATE!" >nul 2>&1
+exit /b
+
+:start_runtime_watchdog
+if not defined LAUNCHER_PID (
+    echo  [*] Could not determine launcher PID -- automatic child cleanup disabled.
+    exit /b
+)
+if not exist "%~dp0runtime-watchdog.ps1" (
+    echo  [*] runtime-watchdog.ps1 not found -- automatic child cleanup disabled.
+    exit /b
+)
+set "GOBBONET_PARENT_PID=!LAUNCHER_PID!"
+set "GOBBONET_RUNTIME_STATE=!RUNTIME_STATE!"
+set "GOBBONET_ROOT=%~dp0."
+set "GOBBONET_LLM_PORT=!SERVER_PORT!"
+set "GOBBONET_EMBED_PORT=!EMBED_PORT!"
+set "GOBBONET_SEARCH_PORT=!SEARCH_PORT!"
+set "GOBBONET_WEB_PORT=!WEB_PORT!"
+start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0runtime-watchdog.ps1"
+exit /b
+
 :minimize_window
 powershell -NoProfile -command "try{Add-Type -Name W -Namespace C -MemberDefinition '[DllImport(\"kernel32.dll\")]public static extern IntPtr GetConsoleWindow();[DllImport(\"user32.dll\")]public static extern bool ShowWindow(IntPtr h,int c);' -EA Stop}catch{};[C.W]::ShowWindow([C.W]::GetConsoleWindow(),6)" >nul 2>&1
 exit /b
@@ -2041,16 +2177,62 @@ if defined HAVE_CURL (
 )
 endlocal & exit /b %_RC%
 
-:: :http_health <url>  -> errorlevel 0 if the body contains "ok"
+:: :http_health <url> -> 0 only for HTTP 2xx whose body contains "ok".
+:: curl --fail is intentional: a 404/500/503 is NOT a healthy service.
 :http_health
 setlocal EnableDelayedExpansion
 set "_RC=1"
 if defined HAVE_CURL (
-    curl.exe -s "%~1" 2>nul | findstr /i "ok" >nul 2>&1
+    curl.exe -fsS --max-time 3 "%~1" 2>nul | findstr /i "ok" >nul 2>&1
     if not errorlevel 1 set "_RC=0"
 ) else (
     set "GN_URL=%~1"
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $c=(New-Object Net.WebClient).DownloadString($env:GN_URL); if ($c -match 'ok') { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r=[Net.HttpWebRequest]::Create($env:GN_URL); $r.Timeout=3000; $x=$r.GetResponse(); $sr=New-Object IO.StreamReader($x.GetResponseStream()); $c=$sr.ReadToEnd(); $sr.Close(); $x.Close(); if ($c -match 'ok') { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
     if not errorlevel 1 set "_RC=0"
 )
+endlocal & exit /b %_RC%
+
+:: :http_service_health <url> <marker> -> 0 only for 2xx + service marker.
+:http_service_health
+setlocal EnableDelayedExpansion
+set "GN_URL=%~1"
+set "GN_MARKER=%~2"
+set "_RC=1"
+if defined HAVE_CURL (
+    for /f "usebackq delims=" %%H in (`curl.exe -fsS --max-time 3 "!GN_URL!" 2^>nul`) do (
+        echo %%H | findstr /i /c:"!GN_MARKER!" >nul 2>&1
+        if not errorlevel 1 set "_RC=0"
+    )
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r=[Net.HttpWebRequest]::Create($env:GN_URL); $r.Timeout=3000; $x=$r.GetResponse(); $sr=New-Object IO.StreamReader($x.GetResponseStream()); $c=$sr.ReadToEnd(); $sr.Close(); $x.Close(); if ($c -like ('*' + $env:GN_MARKER + '*')) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+    if not errorlevel 1 set "_RC=0"
+)
+endlocal & exit /b %_RC%
+
+:: :llama_process_exists <port> -> 0 if a llama-server process has that
+:: configured --port in its command line. This avoids confusing the optional
+:: embedding llama-server (or another unrelated llama.cpp instance) with the
+:: main chat server during startup.
+:llama_process_exists
+setlocal
+set "GN_PORT=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$n=[string]$env:GN_PORT; $rx='(?i)(?:--port\s+|--port=)' + [regex]::Escape($n) + '(?:\s|$)'; $p=Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'llama-server.exe' -and $_.CommandLine -match $rx }; if($p){exit 0}else{exit 1}" >nul 2>&1
+set "_RC=%errorlevel%"
+endlocal & exit /b %_RC%
+
+:: :kill_llama_on_port <port> -> kills only llama-server instances launched
+:: with that --port. Never taskkill /im llama-server.exe: that would also kill
+:: GobboNet's embedding server and any unrelated llama.cpp instance.
+:kill_llama_on_port
+setlocal
+set "GN_PORT=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$n=[string]$env:GN_PORT; $rx='(?i)(?:--port\s+|--port=)' + [regex]::Escape($n) + '(?:\s|$)'; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'llama-server.exe' -and $_.CommandLine -match $rx } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+endlocal & exit /b 0
+
+:: :tcp_probe <port> -> 0 if something is listening on loopback.
+:tcp_probe
+setlocal
+set "GN_PORT=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$c=New-Object Net.Sockets.TcpClient; try { $a=$c.BeginConnect('127.0.0.1',[int]$env:GN_PORT,$null,$null); if(-not $a.AsyncWaitHandle.WaitOne(600)){exit 1}; $c.EndConnect($a); exit 0 } catch { exit 1 } finally { try{$c.Close()}catch{} }" >nul 2>&1
+set "_RC=%errorlevel%"
 endlocal & exit /b %_RC%
