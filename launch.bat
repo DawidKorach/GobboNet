@@ -16,11 +16,18 @@ if not defined GOBBONET_KEEPOPEN (
 )
 setlocal EnableDelayedExpansion
 
-:: PID of the dedicated cmd.exe that is executing this batch. A PowerShell
-:: child can ask Windows for its parent PID; that parent is this cmd.exe.
-:: The runtime watchdog uses it as the authoritative lifetime boundary.
+:: PID of the dedicated cmd.exe that is executing this batch.
+::
+:: Important: FOR /F executes its backtick command through a short-lived
+:: helper cmd.exe. Asking PowerShell for its immediate parent therefore gives
+:: us that helper, which exits as soon as this line finishes. The old watchdog
+:: watched that transient PID and concluded the launcher had already exited.
+:: Walk the ancestor chain and select the cmd.exe whose command line actually
+:: contains this launch.bat path.
 set "LAUNCHER_PID="
-for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$p=(Get-CimInstance Win32_Process -Filter ('ProcessId=' + $PID)).ParentProcessId; [Console]::Write($p)" 2^>nul`) do set "LAUNCHER_PID=%%P"
+set "GN_LAUNCH_SCRIPT=%~f0"
+for /f "usebackq delims=" %%P in (`powershell -NoProfile -Command "$cur=$PID; for($i=0;$i -lt 10;$i++){ $p=Get-CimInstance Win32_Process -Filter ('ProcessId=' + $cur) -ErrorAction SilentlyContinue; if($null -eq $p){break}; if($p.Name -ieq 'cmd.exe' -and ([string]$p.CommandLine).IndexOf($env:GN_LAUNCH_SCRIPT,[StringComparison]::OrdinalIgnoreCase) -ge 0){ [Console]::Write($p.ProcessId); break }; $cur=$p.ParentProcessId }" 2^>nul`) do set "LAUNCHER_PID=%%P"
+set "GN_LAUNCH_SCRIPT="
 title Gobbonet - Local AI Chat [llama.cpp]
 color 0A
 
@@ -138,9 +145,23 @@ if defined GEMMA_LISTEN_PORT (
 ) else (
     set "WEB_PORT=8420"
 )
-set "CTX_SIZE=16384"
-set "GPU_LAYERS=99"
-set "KV_CACHE_TYPE=q8_0"
+if defined GEMMA_CTX_SIZE (
+    set "CTX_SIZE=!GEMMA_CTX_SIZE!"
+) else (
+    set "CTX_SIZE=16384"
+)
+if defined GEMMA_GPU_LAYERS (
+    set "GPU_LAYERS=!GEMMA_GPU_LAYERS!"
+) else (
+    rem Let llama.cpp auto-fit GPU layers to the VRAM available at runtime.
+    rem An explicit numeric value still overrides this via GEMMA_GPU_LAYERS.
+    set "GPU_LAYERS=auto"
+)
+if defined GEMMA_KV_CACHE_TYPE (
+    set "KV_CACHE_TYPE=!GEMMA_KV_CACHE_TYPE!"
+) else (
+    set "KV_CACHE_TYPE=q8_0"
+)
 
 :: ---------------------------------------------------------------
 :: SECURITY -- access password (hashed, set by you on first run)
@@ -1348,7 +1369,11 @@ echo       Model:      !GGUF_PATH!
 echo       Port:       !SERVER_PORT!
 echo       Context:    !CTX_SIZE! tokens
 echo       KV Cache:   !KV_CACHE_TYPE! (quantized for max context)
-echo       GPU layers: !GPU_LAYERS!
+if /I "!GPU_LAYERS!"=="auto" (
+    echo       GPU layers: auto ^(llama.cpp VRAM fit^)
+) else (
+    echo       GPU layers: !GPU_LAYERS!
+)
 echo       Log file:   !LOG_FILE!
 echo.
 echo       NOTE: The GGUF file usually contains its own chat template.
@@ -1488,9 +1513,12 @@ if not "!MODEL_CHAT_TEMPLATE_FILE!"=="" (
 :: this script) instead of %TEMP% so fileserver.ps1 can rewrite it
 :: during a hot-swap and the next monitor-loop restart picks up the
 :: new model.
+set "GPU_LAYERS_FLAG="
+if /I not "!GPU_LAYERS!"=="auto" set "GPU_LAYERS_FLAG=--n-gpu-layers !GPU_LAYERS!"
+
 > "!LAUNCH_SCRIPT!" (
     echo @echo off
-    echo "!SERVER_EXE!" --model "!GGUF_PATH!" --port !SERVER_PORT! --host 127.0.0.1 --ctx-size !CTX_SIZE! --n-gpu-layers !GPU_LAYERS! --cache-type-k !KV_CACHE_TYPE! --cache-type-v !KV_CACHE_TYPE! --parallel 1 !JINJA_FLAG! !CHAT_TEMPLATE_FLAG! --reasoning-format auto ^> "!LOG_FILE!" 2^>^&1
+    echo "!SERVER_EXE!" --model "!GGUF_PATH!" --port !SERVER_PORT! --host 127.0.0.1 --ctx-size !CTX_SIZE! !GPU_LAYERS_FLAG! --cache-type-k !KV_CACHE_TYPE! --cache-type-v !KV_CACHE_TYPE! --parallel 1 !JINJA_FLAG! !CHAT_TEMPLATE_FLAG! --reasoning-format auto ^> "!LOG_FILE!" 2^>^&1
 )
 
 set "OWN_LLM=1"
@@ -1604,10 +1632,11 @@ if exist "!LOG_FILE!" (
     if not errorlevel 1 (
         echo.
         echo  [*] VRAM WARNING: Model is tight on your GPU memory.
-        echo       If you get 500 errors during chat, try:
-        echo         - Reduce CTX_SIZE at the top of this script
-        echo         - Use a smaller model or quantization
-        echo       Current CTX_SIZE = !CTX_SIZE!
+        echo       llama.cpp could not fit the requested configuration cleanly.
+        echo       First try a smaller context while keeping automatic GPU fitting:
+        echo         PowerShell: $env:GEMMA_CTX_SIZE='8192'; Remove-Item Env:GEMMA_GPU_LAYERS -ErrorAction SilentlyContinue; .\launch.bat
+        echo       If needed, force fewer GPU layers, e.g. GEMMA_GPU_LAYERS='50'.
+        echo       Current CTX_SIZE = !CTX_SIZE!, GPU_LAYERS = !GPU_LAYERS!
     )
 )
 :after_vram_check
@@ -1713,57 +1742,18 @@ echo  [OK] Embedding server ready on :!EMBED_PORT!
 echo.
 
 :: ---------------------------------------------------------------
-:: STEP 4: SEARCH PROXY (loopback -> ollama.com/api)
-:: The old launcher embedded this entire PowerShell service as a Base64
-:: command with port 11435 hard-coded inside it. Keep the proxy in a normal
-:: source file instead so the port is configurable and failures are visible.
+:: STEP 4: WEB SEARCH RELAY
+:: ---------------------------------------------------------------
+:: Search is now relayed directly by fileserver.ps1. There is no second
+:: HttpListener on :11435, which avoids Windows HTTP.sys URLACL conflicts
+:: ("Access is denied") and removes one detached process from the lifecycle.
+:: Clean up a searchproxy.ps1 left behind by an older GobboNet build.
 :: ---------------------------------------------------------------
 :start_proxy
+call :kill_project_powershell_script "searchproxy.ps1"
+echo  [OK] Web search relay is integrated into the file server
 
-call :http_service_health "http://127.0.0.1:!SEARCH_PORT!/health" "gobbonet-search-proxy"
-if not errorlevel 1 (
-    echo  [OK] Search proxy on :!SEARCH_PORT!
-    goto :launch
-)
-
-call :tcp_probe !SEARCH_PORT!
-if not errorlevel 1 (
-    echo  [*] Port !SEARCH_PORT! is occupied by another or unhealthy service.
-    echo      Web search will be disabled; chat still works normally.
-    echo      Set GEMMA_SEARCH_PORT to another free port if needed.
-    goto :launch
-)
-
-if not exist "%~dp0searchproxy.ps1" (
-    echo  [*] searchproxy.ps1 not found -- web search will not work.
-    goto :launch
-)
-
-echo  [..] Starting search proxy on :!SEARCH_PORT!...
-set "GEMMA_ROOT=%~dp0."
-set "GEMMA_SEARCH_PORT=!SEARCH_PORT!"
-set "OWN_SEARCH=1"
-call :write_runtime_state
-start /min powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0searchproxy.ps1"
-
-set "PRETRIES=0"
-:proxy_wait
-set /a PRETRIES+=1
-if !PRETRIES! gtr 10 (
-    echo  [*] Search proxy failed. Web search will not work.
-    if exist "%~dp0search-proxy.log" (
-        echo      --- search-proxy.log -----------------------------------
-        type "%~dp0search-proxy.log"
-        echo      -------------------------------------------------------
-    )
-    echo      Chat still functions normally without search.
-    goto :launch
-)
-timeout /t 1 /nobreak >nul
-call :http_service_health "http://127.0.0.1:!SEARCH_PORT!/health" "gobbonet-search-proxy"
-if errorlevel 1 goto :proxy_wait
-echo  [OK] Search proxy on :!SEARCH_PORT!
-echo.
+goto :launch
 
 :: ---------------------------------------------------------------
 :: STEP 5: FILE SERVER (serves chat.html over HTTP for LAN access)
@@ -1778,10 +1768,21 @@ if not exist "%~dp0chat.html" (
 :: Start the HTTP file server. Probe its dedicated unauthenticated health
 :: endpoint, not merely "did anything answer on this port". That distinction
 :: prevents IIS/Apache/EDB/etc. from being mistaken for GobboNet.
-call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver"
+call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver-v2"
 if not errorlevel 1 (
     echo  [OK] File server already running on :!WEB_PORT!
     goto :get_lan_ip
+)
+
+:: A previous patched build may still be alive because its watchdog watched
+:: the wrong transient cmd.exe PID. If the port answers with the legacy
+:: GobboNet marker, stop only fileserver.ps1 processes from THIS project root
+:: and start a fresh v2 instance with the current LLM/search configuration.
+call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver"
+if not errorlevel 1 (
+    echo  [..] Legacy/stale GobboNet file server detected on :!WEB_PORT! -- restarting it...
+    call :kill_project_powershell_script "fileserver.ps1"
+    timeout /t 2 /nobreak >nul
 )
 call :tcp_probe !WEB_PORT!
 if not errorlevel 1 (
@@ -1863,7 +1864,7 @@ if !FRETRIES! gtr 8 (
     goto :get_lan_ip
 )
 timeout /t 1 /nobreak >nul
-call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver"
+call :http_service_health "http://127.0.0.1:!WEB_PORT!/health-fileserver" "gobbonet-fileserver-v2"
 if errorlevel 1 goto :fserver_wait
 echo  [OK] File server on :!WEB_PORT!
 
@@ -2023,32 +2024,68 @@ call :minimize_window
 :: ---------------------------------------------------------------
 :: HEALTH MONITOR
 :: ---------------------------------------------------------------
+:: A single 3-second /health timeout is NOT proof that llama-server died.
+:: With --parallel 1 a large model can spend a while prefilling/generating and
+:: the health request may be delayed. Older builds immediately task-killed the
+:: server on the first missed probe, which could literally terminate a healthy
+:: generation and surface in the UI as "underlying connection was closed".
+::
+:: Policy now:
+::   * process gone                      -> restart immediately
+::   * process alive but TCP port gone  -> restart after 3 consecutive checks
+::   * process + TCP listener alive     -> assume busy; never kill on one probe
+::   * still unhealthy for 5 minutes    -> snapshot log and restart as hung
+:: ---------------------------------------------------------------
+set "MONITOR_UNHEALTHY=0"
 :monitor_loop
 timeout /t 15 /nobreak >nul
 
 call :http_health "http://127.0.0.1:!SERVER_PORT!/health"
-if not errorlevel 1 goto :monitor_loop
+if not errorlevel 1 (
+    set "MONITOR_UNHEALTHY=0"
+    goto :monitor_loop
+)
 
-:: ---- llama-server is unreachable ----
-::
-:: Before assuming a crash, check whether fileserver.ps1 is doing a
-:: hot-swap right now. During a swap it intentionally kills the
-:: running llama-server, rewrites !LAUNCH_SCRIPT!, and spawns a new
-:: one -- if we race in with our own taskkill + restart we end up
-:: with two server processes fighting for the same port. The lock
-:: file is created BEFORE the kill and removed once the new server
-:: reports healthy (or the swap errors out), so it's the source of
-:: truth for "leave this alone".
+:: During an intentional hot-swap, fileserver.ps1 owns the transition.
 if exist "!SWAP_LOCK!" (
+    set "MONITOR_UNHEALTHY=0"
     echo  [..] %TIME% -- llama-server transitioning ^(hot-swap in progress^), monitor standing down.
     goto :monitor_loop
 )
 
-:: ---- Server is down - restart it ----
+:: If the process itself is gone there is no ambiguity: restart it.
+call :llama_process_exists !SERVER_PORT!
+if errorlevel 1 goto :restart_server_now
+
+:: Process exists. If its listener has disappeared too, require three
+:: consecutive failures before restarting so brief socket transitions do not
+:: destroy an in-flight request.
+call :tcp_probe !SERVER_PORT!
+if errorlevel 1 (
+    set /a MONITOR_UNHEALTHY+=1
+    echo  [..] %TIME% -- llama-server process exists but port !SERVER_PORT! is closed ^(!MONITOR_UNHEALTHY!/3^).
+    if !MONITOR_UNHEALTHY! lss 3 goto :monitor_loop
+    goto :restart_server_now
+)
+
+:: Process AND listener are alive. Treat an unavailable /health endpoint as a
+:: busy server. Only declare it hung after 20 consecutive 15-second checks.
+set /a MONITOR_UNHEALTHY+=1
+if !MONITOR_UNHEALTHY! equ 1 (
+    echo  [..] %TIME% -- health probe missed, but llama-server and port !SERVER_PORT! are alive; leaving active generation alone.
+)
+if !MONITOR_UNHEALTHY! lss 20 goto :monitor_loop
+
+echo  [*] %TIME% -- llama-server stayed unhealthy for about 5 minutes while its process/socket remained alive.
+goto :restart_server_now
+
+:restart_server_now
+set "MONITOR_UNHEALTHY=0"
 call :restore_window
 echo.
-echo  [*] %TIME% - llama-server stopped responding!
-echo  [..] Killing stale llama-server on port !SERVER_PORT!...
+echo  [*] %TIME% - llama-server requires restart
+call :snapshot_llama_log
+echo  [..] Killing llama-server on port !SERVER_PORT!...
 call :kill_llama_on_port !SERVER_PORT!
 timeout /t 3 /nobreak >nul
 
@@ -2115,6 +2152,29 @@ set "GOBBONET_SEARCH_PORT=!SEARCH_PORT!"
 set "GOBBONET_WEB_PORT=!WEB_PORT!"
 start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0runtime-watchdog.ps1"
 exit /b
+
+:: Preserve the log that explains why a runtime restart was needed. The
+:: launcher script redirects with >, so without this snapshot the restart would
+:: immediately truncate the evidence from the failure that triggered it.
+:snapshot_llama_log
+if not exist "!LOG_FILE!" exit /b
+copy /y "!LOG_FILE!" "%~dp0llama-server.last-crash.log" >nul 2>&1
+echo  [LOG] Preserved pre-restart log as:
+echo        %~dp0llama-server.last-crash.log
+echo  [LOG] Last 20 lines before restart:
+powershell -NoProfile -Command "Get-Content -LiteralPath '!LOG_FILE!' -Tail 20" 2>nul
+echo.
+exit /b
+
+:: Stop only a PowerShell process that is running the named script from this
+:: GobboNet project root. Used to retire stale services from the previous
+:: lifecycle implementation without touching unrelated PowerShell sessions.
+:kill_project_powershell_script
+setlocal
+set "GN_SCRIPT=%~1"
+set "GN_ROOT=%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$root=[IO.Path]::GetFullPath($env:GN_ROOT).TrimEnd('\'); $script=[string]$env:GN_SCRIPT; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('powershell.exe','pwsh.exe') -and ([string]$_.CommandLine).IndexOf($root,[StringComparison]::OrdinalIgnoreCase) -ge 0 -and ([string]$_.CommandLine).IndexOf($script,[StringComparison]::OrdinalIgnoreCase) -ge 0 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+endlocal & exit /b 0
 
 :minimize_window
 powershell -NoProfile -command "try{Add-Type -Name W -Namespace C -MemberDefinition '[DllImport(\"kernel32.dll\")]public static extern IntPtr GetConsoleWindow();[DllImport(\"user32.dll\")]public static extern bool ShowWindow(IntPtr h,int c);' -EA Stop}catch{};[C.W]::ShowWindow([C.W]::GetConsoleWindow(),6)" >nul 2>&1

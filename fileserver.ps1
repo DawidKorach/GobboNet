@@ -4,9 +4,9 @@
 # Responsibilities:
 #   1. Serve static files (chat.html, style.css, active-model.json, models-list.json, etc.)
 #      from the project root on the configured HTTP listen port.
-#   2. Reverse-proxy /llm/*    -> http://127.0.0.1:$LlmPort     (llama-server)
-#                   /search/*  -> http://127.0.0.1:$SearchPort  (Ollama search proxy)
-#                   /embed/*   -> http://127.0.0.1:$EmbedPort   (embedding llama-server, optional)
+#   2. Reverse-proxy /llm/*    -> http://127.0.0.1:$LlmPort   (llama-server)
+#                   /embed/*   -> http://127.0.0.1:$EmbedPort (embedding llama-server, optional)
+#      Relay         /search/*  -> https://ollama.com/api/*   (only on explicit search)
 #   3. Persist a JSON blob at /state for cross-device state sync (GET + POST).
 #   4. Run detached generation jobs at /llm/jobs* -- the server makes the
 #      llama-server call itself in a worker runspace and spools the raw SSE
@@ -27,7 +27,7 @@
 #   own kill+restart cycle, so the two never race.
 #
 # Configuration is read from environment variables set by launch.bat:
-#   GEMMA_ROOT, GEMMA_LLM_PORT, GEMMA_SEARCH_PORT, GEMMA_EMBED_PORT,
+#   GEMMA_ROOT, GEMMA_LLM_PORT, GEMMA_EMBED_PORT,
 #   GEMMA_SERVER_EXE, GEMMA_MODEL_DIR, GEMMA_CTX_SIZE, GEMMA_GPU_LAYERS,
 #   GEMMA_KV_CACHE_TYPE, GEMMA_LOG_FILE, GEMMA_LAUNCH_SCRIPT
 #
@@ -36,6 +36,7 @@
 # ==============================================================================
 
 $ErrorActionPreference = 'Continue'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # --- Config ------------------------------------------------------------------
 
@@ -47,7 +48,9 @@ function Get-EnvOrDefault {
 
 $Root         = Get-EnvOrDefault 'GEMMA_ROOT'           (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $LlmPort      = [int](Get-EnvOrDefault 'GEMMA_LLM_PORT'      '11437')
-$SearchPort   = [int](Get-EnvOrDefault 'GEMMA_SEARCH_PORT'   '11435')
+# Search no longer needs a second local listener/port. /search/* is relayed
+# directly from this file server to ollama.com, eliminating HTTP.sys URLACL
+# failures on the old 11435 helper listener.
 # Embedding service (RAG Retriever A). Optional infra: if it's down, the
 # /embed proxy below returns 502 and chat.html degrades to tag-only retrieval.
 $EmbedPort    = [int](Get-EnvOrDefault 'GEMMA_EMBED_PORT'    '11436')
@@ -80,7 +83,7 @@ Say ("[boot] fileserver starting -- prefix {0}" -f $ListenPrefix)
 $ServerExe    = Get-EnvOrDefault 'GEMMA_SERVER_EXE'     ''
 $ModelDir     = Get-EnvOrDefault 'GEMMA_MODEL_DIR'      (Join-Path $Root 'models')
 $CtxSize      = [int](Get-EnvOrDefault 'GEMMA_CTX_SIZE'      '16384')
-$GpuLayers    = [int](Get-EnvOrDefault 'GEMMA_GPU_LAYERS'    '99')
+$GpuLayers    = (Get-EnvOrDefault 'GEMMA_GPU_LAYERS'    'auto').Trim()
 $KvCacheType  = Get-EnvOrDefault 'GEMMA_KV_CACHE_TYPE'  'q8_0'
 $LogFile      = Get-EnvOrDefault 'GEMMA_LOG_FILE'       (Join-Path $Root 'llama-server.log')
 $LaunchScript = Get-EnvOrDefault 'GEMMA_LAUNCH_SCRIPT'  (Join-Path $Root '.llama-launch.cmd')
@@ -525,6 +528,94 @@ function Invoke-Proxy {
         try {
             Write-Json $Response 502 @{ error = 'upstream unreachable'; detail = $_.Exception.Message }
         } catch { }
+    }
+}
+
+# --- Integrated web-search relay ----------------------------------------------
+#
+# The browser talks same-origin to /search/*. Older builds proxied that request
+# through a second local HttpListener on :11435. On some Windows installations
+# HTTP.sys rejects that listener with "Access is denied" unless a URL ACL exists.
+# Since the file server already owns the authenticated request, forwarding to
+# ollama.com directly is simpler, avoids a second port/process, and preserves the
+# privacy contract: no network request occurs until the user invokes search.
+function Invoke-SearchRelay {
+    param($Request, $Response)
+
+    $path = $Request.Url.AbsolutePath
+    $subPath = $path.Substring('/search'.Length)
+    if ([string]::IsNullOrEmpty($subPath)) { $subPath = '/' }
+
+    if ($subPath -eq '/health') {
+        Write-Json $Response 200 @{ status = 'ok'; service = 'gobbonet-search-relay'; mode = 'integrated' }
+        return
+    }
+
+    if ($Request.HttpMethod -ne 'POST') {
+        Write-Json $Response 405 @{ error = 'POST only' }
+        return
+    }
+
+    $targetUrl = 'https://ollama.com/api' + $subPath
+    if ($Request.Url.Query) { $targetUrl += $Request.Url.Query }
+
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($targetUrl)
+        $req.Method = 'POST'
+        $req.KeepAlive = $false
+        $req.AllowAutoRedirect = $false
+        $req.Timeout = 60000
+        $req.ReadWriteTimeout = 60000
+
+        # Deliberately forward only what the Ollama search API needs. Do not
+        # leak GobboNet session cookies, LAN Origin/Referer, or browser headers
+        # to the external search service.
+        $req.ContentType = if ($Request.ContentType) { [string]$Request.ContentType } else { 'application/json' }
+        $req.Accept = 'application/json'
+        $auth = [string]$Request.Headers['Authorization']
+        if (-not [string]::IsNullOrWhiteSpace($auth)) {
+            try { $req.Headers[[System.Net.HttpRequestHeader]::Authorization] = $auth } catch { $req.Headers.Add('Authorization', $auth) }
+        }
+
+        if ($Request.HasEntityBody) {
+            $ms = New-Object System.IO.MemoryStream
+            $Request.InputStream.CopyTo($ms)
+            $body = $ms.ToArray(); $ms.Dispose()
+            $req.ContentLength = $body.Length
+            $os = $req.GetRequestStream()
+            if ($body.Length -gt 0) { $os.Write($body, 0, $body.Length) }
+            $os.Close()
+        } else {
+            $req.ContentLength = 0
+        }
+
+        try {
+            $upResp = $req.GetResponse()
+        } catch [System.Net.WebException] {
+            if ($_.Exception.Response) { $upResp = $_.Exception.Response } else { throw }
+        }
+
+        $Response.StatusCode = [int]$upResp.StatusCode
+        foreach ($key in $upResp.Headers.AllKeys) {
+            $val = $upResp.Headers[$key]
+            switch -Regex ($key) {
+                '^(Transfer-Encoding|Connection|Keep-Alive|Content-Length|Set-Cookie)$' { continue }
+                '^Content-Type$' { $Response.ContentType = $val; continue }
+                default { try { $Response.Headers.Add($key, $val) } catch { } }
+            }
+        }
+
+        $inStream = $upResp.GetResponseStream()
+        $buf = New-Object byte[] 8192
+        $Response.SendChunked = $true
+        while (($n = $inStream.Read($buf, 0, $buf.Length)) -gt 0) {
+            $Response.OutputStream.Write($buf, 0, $n)
+        }
+        $inStream.Close()
+        try { $upResp.Close() } catch { }
+    } catch {
+        Write-Host ("[search] {0} -> {1}" -f $targetUrl, $_.Exception.Message)
+        try { Write-Json $Response 502 @{ error = 'search relay failure'; detail = $_.Exception.Message } } catch { }
     }
 }
 
@@ -1109,11 +1200,17 @@ function Build-LaunchScript {
         '--port',      "$LlmPort",
         '--host',      '127.0.0.1',
         '--ctx-size',  "$CtxSize",
-        '--n-gpu-layers', "$GpuLayers",
         '--cache-type-k', $KvCacheType,
         '--cache-type-v', $KvCacheType,
         '--parallel',  '1'
     )
+
+    # Newer llama.cpp defaults --n-gpu-layers to auto and --fit to on.
+    # Leaving the argument unset is important: an explicit numeric value
+    # disables the fitter's ability to move layers out of VRAM.
+    if ($GpuLayers -and $GpuLayers -ne 'auto') {
+        $argList += @('--n-gpu-layers', $GpuLayers)
+    }
     
     if ($useJinja) { $argList += '--jinja' }
     
@@ -1541,6 +1638,7 @@ try {
 Say ("[ok] listening on {0}" -f $BoundPrefix)
 Say ("[ok] access password required (salted-hash verified; set via launch.bat)")
 Say ("[ok] detached generation jobs enabled (spool: {0})" -f $JobsDir)
+Say "[ok] web search relay integrated into file server (no local search listener)"
 if ($LlmApiKey -eq '') {
     Write-Host "[warn] GEMMA_LLM_API_KEY not set -- llama-server running without --api-key (loopback bind still protects it)."
 } else {
@@ -1574,7 +1672,13 @@ while ($listener.IsListening) {
         # GobboNet-specific marker; this prevents an unrelated server on the
         # same port from being accepted as our file server.
         if ($path -eq '/health-fileserver') {
-            Write-Json $response 200 @{ status = 'ok'; service = 'gobbonet-fileserver'; pid = $PID; hotswap = $HotSwapEnabled }
+            Write-Json $response 200 @{ status = 'ok'; service = 'gobbonet-fileserver-v2'; pid = $PID; hotswap = $HotSwapEnabled; llmPort = $LlmPort; embedPort = $EmbedPort; search = 'integrated' }
+        }
+        elseif ($path -eq '/search/health') {
+            # Unauthenticated on purpose: this contains no secret state and lets
+            # launch diagnostics/settings verify that the integrated relay route
+            # exists without needing to manufacture a browser session cookie.
+            Invoke-SearchRelay -Request $request -Response $response
         }
         # A few other routes are reachable without a session: the login
         # page/handler, logout, OPTIONS preflight, and the favicon.
@@ -1666,7 +1770,7 @@ while ($listener.IsListening) {
             Invoke-Proxy -Request $request -Response $response -Prefix '/llm' -UpstreamPort $LlmPort -InjectLlmKey $true
         }
         elseif ($path -eq '/search' -or $path -like '/search/*') {
-            Invoke-Proxy -Request $request -Response $response -Prefix '/search' -UpstreamPort $SearchPort
+            Invoke-SearchRelay -Request $request -Response $response
         }
         elseif ($path -eq '/embed' -or $path -like '/embed/*') {
             # RAG embedding upstream (llama-server --embeddings on loopback).
