@@ -1,5 +1,10 @@
 @echo off
-setlocal
+:: EnableDelayedExpansion is required: the web UI port is resolved at
+:: runtime into WEB_PORT and every rule below refers to it with !WEB_PORT!.
+:: With plain setlocal those would expand to literal text and the firewall
+:: rules would be written for a port called "!WEB_PORT!" -- which fails
+:: quietly and looks exactly like a firewall that did not work.
+setlocal EnableDelayedExpansion
 title Gemma 4 -- LAN Access Setup (one-time)
 color 0A
 
@@ -40,17 +45,49 @@ echo  [OK] Running with Administrator privileges.
 echo.
 
 :: ---------------------------------------------------------------
+:: Resolve the web UI port exactly the way launch.bat does, or the
+:: firewall rule and the URL ACL end up on a port nothing listens on --
+:: which looks like a broken firewall and is nothing of the kind.
+:: ---------------------------------------------------------------
+set "WEB_PORT="
+if exist "%~dp0.gobbonet-port" (
+    for /f "usebackq delims=" %%P in ("%~dp0.gobbonet-port") do if not defined WEB_PORT set "WEB_PORT=%%P"
+)
+if defined GEMMA_LISTEN_PORT set "WEB_PORT=!GEMMA_LISTEN_PORT!"
+if not defined WEB_PORT set "WEB_PORT=9066"
+echo !WEB_PORT!| findstr /r "^[0-9][0-9]*$" >nul 2>&1
+if errorlevel 1 set "WEB_PORT=9066"
+if !WEB_PORT! lss 1024 set "WEB_PORT=9066"
+if !WEB_PORT! gtr 32767 set "WEB_PORT=9066"
+echo  [OK] Web UI port: !WEB_PORT!
+
+:: Service ports, resolved exactly as launch.bat resolves them. llama.cpp
+:: moved off 11434 because that is Ollama's default and the two collided.
+if defined GEMMA_LLM_PORT (
+    set "LLM_PORT=!GEMMA_LLM_PORT!"
+) else (
+    set "LLM_PORT=11437"
+)
+if defined GEMMA_SEARCH_PORT (
+    set "SEARCH_PORT=!GEMMA_SEARCH_PORT!"
+) else (
+    set "SEARCH_PORT=11435"
+)
+echo  [OK] llama.cpp port: !LLM_PORT!   search proxy port: !SEARCH_PORT!
+echo.
+
+:: ---------------------------------------------------------------
 :: FIREWALL RULES
 :: ---------------------------------------------------------------
 echo  [..] Adding firewall rules...
 
 netsh advfirewall firewall show rule name="Gemma4-LLM" >nul 2>&1
 if errorlevel 1 (
-    netsh advfirewall firewall add rule name="Gemma4-LLM" dir=in action=allow protocol=TCP localport=11434 profile=private,public remoteip=LocalSubnet >nul
-    echo  [OK] Firewall rule added: Gemma4-LLM (port 11434, llama.cpp, local subnet only)
+    netsh advfirewall firewall add rule name="Gemma4-LLM" dir=in action=allow protocol=TCP localport=!LLM_PORT! profile=private,public remoteip=LocalSubnet >nul
+    echo  [OK] Firewall rule added: Gemma4-LLM (port !LLM_PORT!, llama.cpp, local subnet only)
 ) else (
     rem Repair any pre-existing (possibly wide-open) rule from an older run.
-    netsh advfirewall firewall set rule name="Gemma4-LLM" new dir=in action=allow protocol=TCP localport=11434 profile=private,public remoteip=LocalSubnet >nul
+    netsh advfirewall firewall set rule name="Gemma4-LLM" new dir=in action=allow protocol=TCP localport=!LLM_PORT! profile=private,public remoteip=LocalSubnet >nul
     echo  [OK] Firewall rule updated: Gemma4-LLM (re-scoped to local subnet only)
 )
 
@@ -66,11 +103,11 @@ if errorlevel 1 (
 
 netsh advfirewall firewall show rule name="Gemma4-Web" >nul 2>&1
 if errorlevel 1 (
-    netsh advfirewall firewall add rule name="Gemma4-Web" dir=in action=allow protocol=TCP localport=8080 profile=private,public remoteip=LocalSubnet >nul
-    echo  [OK] Firewall rule added: Gemma4-Web (port 8080, file server, local subnet only)
+    netsh advfirewall firewall add rule name="Gemma4-Web" dir=in action=allow protocol=TCP localport=!WEB_PORT! profile=private,public remoteip=LocalSubnet >nul
+    echo  [OK] Firewall rule added: Gemma4-Web (port !WEB_PORT!, file server, local subnet only)
 ) else (
     rem Repair any pre-existing (possibly wide-open) rule from an older run.
-    netsh advfirewall firewall set rule name="Gemma4-Web" new dir=in action=allow protocol=TCP localport=8080 profile=private,public remoteip=LocalSubnet >nul
+    netsh advfirewall firewall set rule name="Gemma4-Web" new dir=in action=allow protocol=TCP localport=!WEB_PORT! profile=private,public remoteip=LocalSubnet >nul
     echo  [OK] Firewall rule updated: Gemma4-Web (re-scoped to local subnet only)
 )
 
@@ -91,7 +128,7 @@ echo.
 :: know the password to reach your chats -- the firewall and the
 :: password together are the boundary, not the network profile alone.
 ::
-:: Why .local matters: when users bookmark http://<PC>.local:8080
+:: Why .local matters: when users bookmark http://<PC>.local:<port>
 :: instead of the IP, the browser keeps localStorage stable across
 :: IP rotations (same hostname = same origin). No more lost chats
 :: when DHCP hands out a new lease.
@@ -160,20 +197,40 @@ echo  [..] Adding URL ACL reservations...
 ::
 :: This matters more than it looks. "I ran setup-lan.bat and it said OK"
 :: was being treated as proof the ACL existed, which sent diagnosis of
-:: the :8080 failures down the wrong path.
+:: the web-port failures down the wrong path.
 :: ---------------------------------------------------------------
 
-call :add_urlacl 11435 "search proxy"
-call :add_urlacl 8080 "file server"
+call :add_urlacl !SEARCH_PORT! "search proxy"
+call :add_urlacl !WEB_PORT! "file server"
+
+:: Upgrade cleanup. Installs before 1.5.5 defaulted to 8080 and left a URL
+:: ACL behind for it. It is harmless but it is also a reservation on a port
+:: half the developer world wants, which is the exact rudeness that
+:: prompted the move. Drop it if we are no longer using it.
+if not "!SEARCH_PORT!"=="11435" (
+    netsh http show urlacl url=http://+:11435/ 2>nul | findstr /i ":11435/" >nul 2>&1
+    if not errorlevel 1 (
+        netsh http delete urlacl url=http://+:11435/ >nul 2>&1
+        echo  [OK] Removed the old URL ACL for http://+:11435/ ^(no longer used^)
+    )
+)
+
+if not "!WEB_PORT!"=="8080" (
+    netsh http show urlacl url=http://+:8080/ 2>nul | findstr /i ":8080/" >nul 2>&1
+    if not errorlevel 1 (
+        netsh http delete urlacl url=http://+:8080/ >nul 2>&1
+        echo  [OK] Removed the old URL ACL for http://+:8080/ ^(no longer used^)
+    )
+)
 
 :: ---------------------------------------------------------------
 :: RESERVED PORT RANGES -- the one failure this script cannot repair.
 ::
 :: Hyper-V, WSL2, Docker Desktop and the Windows NAT service reserve
-:: large dynamic TCP blocks, and 8080 lands inside one often enough to
+:: large dynamic TCP blocks, and a web port can land inside one often enough to
 :: be a leading suspect. A reserved port refuses to bind even when it is
 :: genuinely free, and even when elevated. netstat cannot see the
-:: reservation, so "netstat says nothing is on 8080" is true and
+:: reservation, so "netstat says nothing is on that port" is true and
 :: misleading at once. Say so, rather than letting someone re-run this
 :: script forever.
 :: ---------------------------------------------------------------
@@ -184,12 +241,12 @@ for /f "tokens=1,2" %%A in ('netsh interface ipv4 show excludedportrange protoco
     if not errorlevel 1 (
         echo %%B| findstr /r "^[0-9][0-9]*$" >nul 2>&1
         if not errorlevel 1 (
-            if %%A leq 8080 if %%B geq 8080 set "PORT_RESERVED=%%A-%%B"
+            if %%A leq !WEB_PORT! if %%B geq !WEB_PORT! set "PORT_RESERVED=%%A-%%B"
         )
     )
 )
 if defined PORT_RESERVED (
-    echo  [!] Port 8080 is inside a RESERVED range ^(!PORT_RESERVED!^).
+    echo  [!] Port !WEB_PORT! is inside a RESERVED range ^(!PORT_RESERVED!^).
     echo      Windows will refuse the bind even though nothing is using
     echo      the port, and even for an Administrator. This script cannot
     echo      fix that. Pick one:
@@ -198,10 +255,10 @@ if defined PORT_RESERVED (
     echo             set GEMMA_LISTEN_PORT=8420
     echo           then start launch.bat from that same window.
     echo.
-    echo        b^) Reserve 8080 back for normal use, then REBOOT:
-    echo             netsh int ipv4 add excludedportrange protocol=tcp startport=8080 numberofports=1
+    echo        b^) Reserve !WEB_PORT! back for normal use, then REBOOT:
+    echo             netsh int ipv4 add excludedportrange protocol=tcp startport=!WEB_PORT! numberofports=1
 ) else (
-    echo  [OK] Port 8080 is not inside a reserved range.
+    echo  [OK] Port !WEB_PORT! is not inside a reserved range.
 )
 
 echo.
@@ -209,8 +266,8 @@ echo  ====================================================
 echo   All done! You can now run launch.bat normally.
 echo.
 echo   Your phone will be able to connect at:
-echo     http://%COMPUTERNAME%.local:8080  [recommended]
-echo     http://YOUR_PC_IP:8080            [alternate]
+echo     http://%COMPUTERNAME%.local:!WEB_PORT!  [recommended]
+echo     http://YOUR_PC_IP:!WEB_PORT!            [alternate]
 echo.
 echo   The .local URL is preferred -- it stays the same
 echo   even when your PC's IP rotates, so your phone's
@@ -224,7 +281,7 @@ echo     netsh advfirewall firewall delete rule name="Gemma4-Search"
 echo     netsh advfirewall firewall delete rule name="Gemma4-Web"
 echo     netsh advfirewall firewall delete rule name="Gemma4-mDNS"
 echo     netsh http delete urlacl url=http://+:11435/
-echo     netsh http delete urlacl url=http://+:8080/
+echo     netsh http delete urlacl url=http://+:!WEB_PORT!/
 echo  ====================================================
 
 :: ===============================================================

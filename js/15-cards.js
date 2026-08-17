@@ -7,6 +7,8 @@
    SETTINGS
 ================================================================ */
 function openSettings() {
+  // Pulls live values from the server; safe if the endpoint is absent.
+  try { loadPerfSettings(); } catch (e) { console.error('[perf]', e); }
   // Model dropdown is in the header — loadModelsList() handles it on startup
   // Reminder frequency, context limit and the smart reply cap have moved to
   // the character card. state.settings.tokenLimit survives as the inherited
