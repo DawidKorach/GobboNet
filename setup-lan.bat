@@ -137,20 +137,71 @@ echo.
 :: ---------------------------------------------------------------
 echo  [..] Adding URL ACL reservations...
 
-netsh http show urlacl url=http://+:11435/ | findstr /i "Reserved URL" >nul
-if errorlevel 1 (
-    netsh http add urlacl url=http://+:11435/ user=Everyone >nul
-    echo  [OK] URL ACL added: http://+:11435/ (search proxy)
-) else (
-    echo  [OK] URL ACL already exists: http://+:11435/
-)
 
-netsh http show urlacl url=http://+:8080/ | findstr /i "Reserved URL" >nul
-if errorlevel 1 (
-    netsh http add urlacl url=http://+:8080/ user=Everyone >nul
-    echo  [OK] URL ACL added: http://+:8080/ (file server)
+:: ---------------------------------------------------------------
+:: LOCALE INDEPENDENCE -- read this before simplifying anything below.
+::
+:: The previous version stacked three English-only assumptions, and on a
+:: localised Windows they combined into a script that reported success
+:: while doing nothing at all:
+::
+::   1. findstr matched an ENGLISH netsh header. On a German or French
+::      Windows that header is translated, the match always failed, and
+::      the script always took the "add" branch.
+::   2. The account name in the add command is LOCALISED -- Jeder, Tout
+::      le monde, Todos, Wszyscy -- so the add failed with "no such
+::      account".
+::   3. >nul swallowed that error and nothing checked errorlevel, so it
+::      printed [OK] URL ACL added having added nothing.
+::
+:: Fixes: match on the URL itself, which is never translated; use the
+:: SDDL form, where WD is the well-known Everyone SID S-1-1-0 and is
+:: byte-identical on every locale; and VERIFY afterwards.
+::
+:: This matters more than it looks. "I ran setup-lan.bat and it said OK"
+:: was being treated as proof the ACL existed, which sent diagnosis of
+:: the :8080 failures down the wrong path.
+:: ---------------------------------------------------------------
+
+call :add_urlacl 11435 "search proxy"
+call :add_urlacl 8080 "file server"
+
+:: ---------------------------------------------------------------
+:: RESERVED PORT RANGES -- the one failure this script cannot repair.
+::
+:: Hyper-V, WSL2, Docker Desktop and the Windows NAT service reserve
+:: large dynamic TCP blocks, and 8080 lands inside one often enough to
+:: be a leading suspect. A reserved port refuses to bind even when it is
+:: genuinely free, and even when elevated. netstat cannot see the
+:: reservation, so "netstat says nothing is on 8080" is true and
+:: misleading at once. Say so, rather than letting someone re-run this
+:: script forever.
+:: ---------------------------------------------------------------
+echo  [..] Checking reserved TCP port ranges...
+set "PORT_RESERVED="
+for /f "tokens=1,2" %%A in ('netsh interface ipv4 show excludedportrange protocol^=tcp 2^>nul') do (
+    echo %%A| findstr /r "^[0-9][0-9]*$" >nul 2>&1
+    if not errorlevel 1 (
+        echo %%B| findstr /r "^[0-9][0-9]*$" >nul 2>&1
+        if not errorlevel 1 (
+            if %%A leq 8080 if %%B geq 8080 set "PORT_RESERVED=%%A-%%B"
+        )
+    )
+)
+if defined PORT_RESERVED (
+    echo  [!] Port 8080 is inside a RESERVED range ^(!PORT_RESERVED!^).
+    echo      Windows will refuse the bind even though nothing is using
+    echo      the port, and even for an Administrator. This script cannot
+    echo      fix that. Pick one:
+    echo.
+    echo        a^) Use a different port. Before launching, run:
+    echo             set GEMMA_LISTEN_PORT=8420
+    echo           then start launch.bat from that same window.
+    echo.
+    echo        b^) Reserve 8080 back for normal use, then REBOOT:
+    echo             netsh int ipv4 add excludedportrange protocol=tcp startport=8080 numberofports=1
 ) else (
-    echo  [OK] URL ACL already exists: http://+:8080/
+    echo  [OK] Port 8080 is not inside a reserved range.
 )
 
 echo.
@@ -175,5 +226,44 @@ echo     netsh advfirewall firewall delete rule name="Gemma4-mDNS"
 echo     netsh http delete urlacl url=http://+:11435/
 echo     netsh http delete urlacl url=http://+:8080/
 echo  ====================================================
+
+:: ===============================================================
+:: :add_urlacl <port> <label>
+:: Adds a URL ACL for http://+:<port>/ and confirms it landed.
+:: goto :eof above this guard stops the main flow falling into it.
+:: ===============================================================
+goto :after_subs
+
+:add_urlacl
+setlocal EnableDelayedExpansion
+set "_PORT=%~1"
+set "_LABEL=%~2"
+
+:: Match the URL, not the header. netsh translates its headers; it does
+:: not translate the reservation it is printing.
+netsh http show urlacl url=http://+:!_PORT!/ 2>nul | findstr /i ":!_PORT!/" >nul 2>&1
+if not errorlevel 1 (
+    echo  [OK] URL ACL already exists: http://+:!_PORT!/ ^(!_LABEL!^)
+    endlocal & goto :eof
+)
+
+:: SDDL form. WD is the Everyone SID; GX is the generic-execute right
+:: HTTP.SYS checks when handing out a prefix reservation.
+netsh http add urlacl url=http://+:!_PORT!/ sddl=D:(A;;GX;;;WD) >nul 2>&1
+
+:: Verify instead of assuming. This is the entire point of the rewrite.
+netsh http show urlacl url=http://+:!_PORT!/ 2>nul | findstr /i ":!_PORT!/" >nul 2>&1
+if errorlevel 1 (
+    echo  [ERROR] Could not add a URL ACL for http://+:!_PORT!/ ^(!_LABEL!^)
+    echo          Run this by hand in this window and paste the output:
+    echo            netsh http add urlacl url=http://+:!_PORT!/ sddl=D:^(A;;GX;;;WD^)
+    echo          Without it, GobboNet falls back to this PC only -- the
+    echo          chat still works locally, but phones will not reach it.
+) else (
+    echo  [OK] URL ACL added: http://+:!_PORT!/ ^(!_LABEL!^)
+)
+endlocal & goto :eof
+
+:after_subs
 echo.
 pause

@@ -113,6 +113,17 @@ if not defined HAVE_CERTUTIL (
 :: CONFIG - edit these if you want a different model or port
 :: ===============================================================
 set "SERVER_PORT=11434"
+:: Web UI port. Overridable because 8080 is one of the most contended
+:: ports on a Windows machine -- Hyper-V, WSL2, Docker Desktop and the
+:: Windows NAT service all reserve blocks around it, and a reserved port
+:: refuses to bind even when nothing is using it and even when elevated.
+:: fileserver.ps1 reads GEMMA_LISTEN_PORT, so set it before launching:
+::     set GEMMA_LISTEN_PORT=8420 && launch.bat
+if defined GEMMA_LISTEN_PORT (
+    set "WEB_PORT=!GEMMA_LISTEN_PORT!"
+) else (
+    set "WEB_PORT=8080"
+)
 set "CTX_SIZE=16384"
 set "GPU_LAYERS=99"
 set "KV_CACHE_TYPE=q8_0"
@@ -155,8 +166,53 @@ if not exist "!SECRET_FILE!" (
 )
 
 :: Load the stored salt:hash for handoff to the file server.
+::
+:: This is validated on EVERY run, not just the run that created it.
+:: Previously the first-run path checked what landed on disk and every
+:: later run read the file blind -- so if .gobbonet-secret was later
+:: emptied, truncated or locked by antivirus, ACCESS_SECRET came back
+:: empty, GEMMA_ACCESS_SECRET was empty, and fileserver.ps1 exited
+:: instantly inside a hidden window. From the outside that is
+:: indistinguishable from a port or firewall failure, and it sends
+:: everyone hunting the wrong thing.
 set "ACCESS_SECRET="
-for /f "usebackq delims=" %%S in ("!SECRET_FILE!") do set "ACCESS_SECRET=%%S"
+for /f "usebackq delims=" %%S in ("!SECRET_FILE!") do if not defined ACCESS_SECRET set "ACCESS_SECRET=%%S"
+
+if not defined ACCESS_SECRET (
+    echo.
+    echo  [ERROR] .gobbonet-secret exists but is empty or unreadable.
+    echo          Antivirus locking the file is the usual cause.
+    echo.
+    echo          Fix: delete it and run launch.bat again to set a new
+    echo          password:
+    echo             del "!SECRET_FILE!"
+    echo.
+    pause
+    exit /b 1
+)
+
+:: Ask the consumer's own question -- fileserver.ps1 tests this exact
+:: pattern at startup, so a pass here cannot become a failure there.
+if not defined HAVE_PS goto :secret_shape_ok
+set "GN_PWCHECK=!ACCESS_SECRET!"
+powershell -NoProfile -Command "if ($env:GN_PWCHECK -match '^([0-9a-fA-F]+):([0-9a-fA-F]+)$') { exit 0 } else { exit 1 }" >nul 2>&1
+if errorlevel 1 goto :secret_shape_bad
+set "GN_PWCHECK="
+goto :secret_shape_ok
+
+:secret_shape_bad
+set "GN_PWCHECK="
+echo.
+echo  [ERROR] .gobbonet-secret is malformed. Expected one line of
+echo          ^<hex^>:^<hex^> with no trailing newline.
+echo.
+echo          Fix: delete it and run launch.bat again to set a new one:
+echo             del "!SECRET_FILE!"
+echo.
+pause
+exit /b 1
+
+:secret_shape_ok
 
 :: CTX_SIZE notes:
 ::   This is the default starting value. When you pick a model from
@@ -1633,13 +1689,13 @@ if not exist "%~dp0chat.html" (
 
 :: Start a lightweight HTTP file server on port 8080
 :: This lets your phone load chat.html over the network
-call :http_probe "http://127.0.0.1:8080/"
+call :http_probe "http://127.0.0.1:!WEB_PORT!/"
 if not errorlevel 1 (
-    echo  [OK] File server already running on :8080
+    echo  [OK] File server already running on :!WEB_PORT!
     goto :get_lan_ip
 )
 
-echo  [..] Starting file server on :8080...
+echo  [..] Starting file server on :!WEB_PORT!...
 
 :: Use the standalone fileserver.ps1 (reverse proxy included).
 :: Environment variables pass config without batch escaping issues.
@@ -1671,15 +1727,42 @@ set "FRETRIES=0"
 :fserver_wait
 set /a FRETRIES+=1
 if !FRETRIES! gtr 8 (
-    echo  [*] File server failed to start. Phone access will not work.
-    echo      You may need to run setup-lan.bat as Administrator first.
-    echo      Desktop chat still works normally.
+    echo.
+    echo  [*] File server did not come up on :!WEB_PORT!.
+    echo.
+    :: fileserver.ps1 has always printed the specific reason -- into a
+    :: window started with -WindowStyle Hidden, so nobody ever read it.
+    :: It now mirrors startup output to fileserver.log. Print that rather
+    :: than guessing; the old guess named one of four possible causes and
+    :: was usually the wrong one.
+    if exist "%~dp0fileserver.log" (
+        echo      --- fileserver.log -------------------------------------
+        type "%~dp0fileserver.log"
+        echo      -------------------------------------------------------
+    ) else (
+        echo      fileserver.log was never written, which means PowerShell
+        echo      did not run the script at all. Suspect AppLocker or WDAC
+        echo      script policy, or antivirus quarantine of fileserver.ps1.
+    )
+    echo.
+    :: The old text said "Desktop chat still works normally." It does not:
+    :: chat.html is SERVED by this file server and all model traffic is
+    :: proxied same-origin through /llm, so when this is down there is no
+    :: chat at all. A leftover from the pre-proxy design, and reporters
+    :: were right to call it out.
+    echo      Desktop chat is ALSO down -- chat.html is served by this
+    echo      server, so there is nothing for the browser to reach.
+    echo.
+    echo      Stopgap: open chat.html directly from this folder in your
+    echo      browser. It falls back to talking to llama-server on
+    echo      127.0.0.1:!SERVER_PORT! without the proxy, state sync or
+    echo      hot-swap, but it will chat.
     goto :get_lan_ip
 )
 timeout /t 1 /nobreak >nul
-call :http_probe "http://127.0.0.1:8080/"
+call :http_probe "http://127.0.0.1:!WEB_PORT!/"
 if errorlevel 1 goto :fserver_wait
-echo  [OK] File server on :8080
+echo  [OK] File server on :!WEB_PORT!
 
 :: ---------------------------------------------------------------
 :: STEP 6: GET LAN IP + LAUNCH BROWSER
@@ -1953,7 +2036,7 @@ if defined HAVE_CURL (
     if not errorlevel 1 set "_RC=0"
 ) else (
     set "GN_URL=%~1"
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r=[Net.WebRequest]::Create($env:GN_URL); $r.Timeout=3000; $r.GetResponse().Close(); exit 0 } catch { exit 1 }" >nul 2>&1
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $r=[Net.WebRequest]::Create($env:GN_URL); $r.Timeout=3000; $r.GetResponse().Close(); exit 0 } catch [Net.WebException] { if ($_.Exception.Response) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
     if not errorlevel 1 set "_RC=0"
 )
 endlocal & exit /b %_RC%

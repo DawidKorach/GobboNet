@@ -51,7 +51,33 @@ $SearchPort   = [int](Get-EnvOrDefault 'GEMMA_SEARCH_PORT'   '11435')
 # Embedding service (RAG Retriever A). Optional infra: if it's down, the
 # /embed proxy below returns 502 and chat.html degrades to tag-only retrieval.
 $EmbedPort    = [int](Get-EnvOrDefault 'GEMMA_EMBED_PORT'    '11436')
-$ListenPort   = 8080
+# Listen port and prefix, overridable from launch.bat. 8080 is one of the
+# most contended ports on a developer machine -- Hyper-V, WSL2, Docker and
+# the Windows NAT service all reserve blocks around it -- so a user who
+# cannot bind it needs a way out that is not "edit the source".
+$ListenPort   = [int]$(if ($env:GEMMA_LISTEN_PORT) { $env:GEMMA_LISTEN_PORT } else { '8080' })
+$ListenPrefix = $(if ($env:GEMMA_LISTEN_PREFIX) { $env:GEMMA_LISTEN_PREFIX } else { 'http://+:{0}/' -f $ListenPort })
+
+# ---------------------------------------------------------------------------
+# Startup log.
+#
+# launch.bat starts this script with -WindowStyle Hidden, so every diagnostic
+# below has been written to a console nobody can see. On a failure the user
+# got launch.bat's generic guess instead of the specific reason this script
+# already knew. Everything from here to "listening" is mirrored to disk so
+# launch.bat can print it, and so a bug report can include it.
+#
+# Written to $Root rather than %TEMP% so it sits beside the app, next to the
+# other logs, and is removed by the uninstaller with them.
+# ---------------------------------------------------------------------------
+$StartupLog = Join-Path $Root 'fileserver.log'
+try { Remove-Item -LiteralPath $StartupLog -Force -ErrorAction SilentlyContinue } catch { }
+function Say {
+    param([string]$Msg, [string]$Colour = 'Gray')
+    try { Write-Host $Msg -ForegroundColor $Colour } catch { Write-Host $Msg }
+    try { Add-Content -LiteralPath $StartupLog -Value $Msg -ErrorAction SilentlyContinue } catch { }
+}
+Say ("[boot] fileserver starting -- prefix {0}" -f $ListenPrefix)
 $ServerExe    = Get-EnvOrDefault 'GEMMA_SERVER_EXE'     ''
 $ModelDir     = Get-EnvOrDefault 'GEMMA_MODEL_DIR'      (Join-Path $Root 'models')
 $CtxSize      = [int](Get-EnvOrDefault 'GEMMA_CTX_SIZE'      '16384')
@@ -101,8 +127,15 @@ if ($AccessSecret -match '^([0-9a-fA-F]+):([0-9a-fA-F]+)$') {
     $AccessHash = $Matches[2].ToLower()
 }
 if ($AccessHash -eq '') {
-    Write-Host "[FATAL] No access secret provided (GEMMA_ACCESS_SECRET missing or malformed)." -Foreground Red
-    Write-Host "        Run launch.bat -- it sets the password on first run. Exiting." -Foreground Red
+    # This is exit #1 of four, and the one nobody guesses, because it fires
+    # before the listener is ever touched -- so every "it must be a port or
+    # permission problem" instinct is wrong for it. Say it plainly.
+    Say "[FATAL] No access secret provided (GEMMA_ACCESS_SECRET missing or malformed)." 'Red'
+    Say "        This is NOT a port or firewall problem -- the server exited" 'Red'
+    Say "        before it tried to listen." 'Red'
+    Say ("        Check .gobbonet-secret in {0} -- it must be one line of" -f $Root) 'Red'
+    Say "        <hex>:<hex> with no trailing newline. If it is empty or" 'Red'
+    Say "        truncated, delete it and run launch.bat to set a new password." 'Red'
     exit 1
 }
 $LlmApiKey = Get-EnvOrDefault 'GEMMA_LLM_API_KEY' ''
@@ -1449,19 +1482,63 @@ function Handle-SwapStatus {
 # Make sure System.Web is available for UrlDecode.
 Add-Type -AssemblyName System.Web -ErrorAction SilentlyContinue
 
-$listener = New-Object System.Net.HttpListener
-$listener.Prefixes.Add("http://+:$ListenPort/")
+# Construction and binding are separated on purpose. They fail for entirely
+# different reasons and the old single catch reported both as "could not
+# bind ... run setup-lan.bat as Administrator", which sent people hunting
+# for a URL ACL when the real cause was a reserved port range or a
+# restricted PowerShell language mode.
+$listener = $null
 try {
-    $listener.Start()
+    $listener = New-Object System.Net.HttpListener
 } catch {
-    Write-Host ("[fatal] could not bind http://+:{0}/ -- {1}" -f $ListenPort, $_.Exception.Message)
-    Write-Host '         Run setup-lan.bat as Administrator to add the URL ACL.'
+    Say ("[fatal] cannot create System.Net.HttpListener -- {0}" -f $_.Exception.Message) 'Red'
+    Say  "        PowerShell is in a restricted language mode (WDAC / AppLocker)." 'Red'
+    Say ("        LanguageMode = {0}" -f $ExecutionContext.SessionState.LanguageMode) 'Red'
+    Say  "        setup-lan.bat cannot fix this. It is a machine policy." 'Red'
     exit 1
 }
 
-Write-Host ("[ok] listening on http://+:{0}/" -f $ListenPort)
-Write-Host ("[ok] access password required (salted-hash verified; set via launch.bat)")
-Write-Host ("[ok] detached generation jobs enabled (spool: {0})" -f $JobsDir)
+$BoundPrefix = $null
+try {
+    $listener.Prefixes.Add($ListenPrefix)
+    $listener.Start()
+    $BoundPrefix = $ListenPrefix
+} catch {
+    $wildErr = $_.Exception.Message
+    Say ("[warn] could not bind {0} -- {1}" -f $ListenPrefix, $wildErr) 'Yellow'
+
+    # Retry loopback-only before giving up. The wildcard prefix needs a URL
+    # ACL; http://127.0.0.1:<port>/ does not. Someone who only ever uses the
+    # chat on this PC needs no wildcard at all, so a hard exit here turned a
+    # working desktop install into a dead one for no reason.
+    $loopback = 'http://127.0.0.1:{0}/' -f $ListenPort
+    try {
+        $listener = New-Object System.Net.HttpListener
+        $listener.Prefixes.Add($loopback)
+        $listener.Start()
+        $BoundPrefix = $loopback
+        Say ("[ok] listening on {0} -- THIS PC ONLY." -f $loopback) 'Yellow'
+        Say  "     Phones and other devices on your network will NOT reach it." 'Yellow'
+        Say  "     Run setup-lan.bat as Administrator to enable LAN access." 'Yellow'
+    } catch {
+        Say ("[fatal] could not bind {0} either -- {1}" -f $loopback, $_.Exception.Message) 'Red'
+        Say  "        Checklist, in order of likelihood:" 'Red'
+        Say ("          1. netsh interface ipv4 show excludedportrange protocol=tcp") 'Red'
+        Say ("             Is {0} inside a reserved range? Hyper-V, WSL2 and Docker" -f $ListenPort) 'Red'
+        Say  "             reserve blocks around 8080. netstat cannot see these." 'Red'
+        Say ("          2. netsh http show urlacl url={0}" -f $ListenPrefix) 'Red'
+        Say  "             Missing URL ACL -- this is the one setup-lan.bat fixes." 'Red'
+        Say  "          3. netsh http show servicestate" 'Red'
+        Say  "             Another service (IIS, VMware, Citrix) may own the prefix." 'Red'
+        Say  "" 'Red'
+        Say ("        To use a different port, set GEMMA_LISTEN_PORT before launching.") 'Red'
+        exit 1
+    }
+}
+
+Say ("[ok] listening on {0}" -f $BoundPrefix)
+Say ("[ok] access password required (salted-hash verified; set via launch.bat)")
+Say ("[ok] detached generation jobs enabled (spool: {0})" -f $JobsDir)
 if ($LlmApiKey -eq '') {
     Write-Host "[warn] GEMMA_LLM_API_KEY not set -- llama-server running without --api-key (loopback bind still protects it)."
 } else {

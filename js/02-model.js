@@ -38,10 +38,11 @@ async function loadActiveModel() {
     // Update About modal stack line
     const aboutModelLine = document.getElementById('about-model-line');
     if (aboutModelLine) aboutModelLine.textContent = activeModel.name;
-    // If user hasn't customised the token limit yet, suggest the model default
-    const tokInput = document.getElementById('set-tokens');
-    if (tokInput && (!state.settings.tokenLimit || state.settings.tokenLimit === 24576)) {
-      tokInput.value = activeModel.defaultCtx;
+    // Keep the inherited default in step with the loaded model. The settings
+    // input this used to write into is gone -- context limit lives on the
+    // card now -- but state.settings.tokenLimit is still what a card set to
+    // Auto resolves against, so it has to track the model.
+    if (!state.settings.tokenLimit || state.settings.tokenLimit === 24576) {
       state.settings.tokenLimit = activeModel.defaultCtx;
       saveState();
     }
@@ -53,14 +54,13 @@ async function loadActiveModel() {
 function updateModelHint(modelDef) {
   const hint = document.getElementById('model-hint');
   if (hint && modelDef) hint.textContent = modelDef.hint;
-  const ctxHint = document.getElementById('ctx-hint');
-  if (ctxHint && modelDef) {
-    const maxK = Math.round(modelDef.maxCtx / 1024);
-    ctxHint.textContent = `Input context budget — 90% reserved for system prompt, lore, and history. Max for ${modelDef.name}: ${maxK}K tokens. Actual capacity depends on VRAM and KV cache quantization.`;
-  }
-  // Update token input max
-  const tokInput = document.getElementById('set-tokens');
-  if (tokInput && modelDef) tokInput.max = modelDef.maxCtx;
+  // ctx-hint and set-tokens both lived in the settings modal and moved to
+  // the character card. The card editor draws its own hint from
+  // resolveContextLimit (updateCardCtxHint), which reports the resolved
+  // number rather than a static maximum -- more useful, and it cannot drift
+  // from what the context builder actually uses.
+  const cardCtx = document.getElementById('card-context-limit');
+  if (cardCtx && modelDef) cardCtx.max = modelDef.maxCtx;
 }
 
 /* ================================================================
